@@ -19,8 +19,6 @@ jobs:
         run: git diff --check HEAD~1 HEAD
       - name: Run Swift tests
         run: swift test
-      - name: Run core checks
-        run: ./scripts/run-core-checks.sh
       - name: Package local app
         env:
           SWIFT_BUILD_ARCH: arm64
@@ -32,3 +30,5 @@ jobs:
           name: patched-switcher-macos-arm64
           path: patched-switcher.app.zip
           if-no-files-found: error
+      - name: Run core checks
+        run: ./scripts/run-core-checks.sh

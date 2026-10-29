@@ -653,10 +653,10 @@ struct CoreChecks {
             failureModel.usageStates[first.id]?.displayedUsage == nil,
             "failed refresh does not revive an expired cached window"
         )
-        try require(
-            failureModel.usageStates[first.id]?.refreshError != nil,
-            "failed refresh exposes stale-cache warning"
-        )
+        guard case .some(.unavailable(let failureMessage)) = failureModel.usageStates[first.id] else {
+            throw CheckFailure.failed("failed refresh exposes unavailable state")
+        }
+        try require(!failureMessage.isEmpty, "failed refresh gives an unavailable reason")
 
         let stalledCodex = root.appending(path: "stalled-codex")
         try createExecutable(at: stalledCodex, body: """
