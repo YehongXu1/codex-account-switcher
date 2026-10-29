@@ -293,9 +293,9 @@ struct CoreChecks {
 
         let cachedWeekly = WeeklyUsage(
             remainingPercent: 73,
-            resetsAt: Date(timeIntervalSince1970: 1_750_000_000)
+            resetsAt: Date().addingTimeInterval(7 * 24 * 60 * 60)
         )
-        let cachedAt = Date(timeIntervalSince1970: 1_749_000_000)
+        let cachedAt = Date()
         try await store.cacheWeeklyUsage(cachedWeekly, profileID: first.id, fetchedAt: cachedAt)
         let persistedCache = try await store.loadUsageCache()
         try require(
