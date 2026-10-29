@@ -194,11 +194,14 @@ public struct AccountIdentity: Equatable, Sendable {
 }
 
 public enum SwitchStage: String, CaseIterable, Sendable {
+    case prepareHerdr
     case closeDesktop
+    case suspendHerdr
     case saveCurrentCredential
     case activateTargetCredential
     case verifyTargetIdentity
     case commitActiveAccountID
+    case resumeHerdr
     case reopenDesktop
 }
 

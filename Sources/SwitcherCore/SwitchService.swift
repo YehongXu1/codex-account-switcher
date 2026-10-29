@@ -13,15 +13,37 @@ public protocol CodexIdentityReading: Sendable {
 
 public protocol SwitchServicing: Sendable {
     func switchAccount(to targetID: UUID) async throws
+    func hasPendingSessionRecovery() async -> Bool
+    func recoverSessions() async throws
+}
+
+public extension SwitchServicing {
+    func hasPendingSessionRecovery() async -> Bool { false }
+    func recoverSessions() async throws {}
 }
 
 public struct SwitchService: SwitchServicing {
     public let desktop: any DesktopControlling
     public let store: any AccountStoring
     public let codex: any CodexIdentityReading
+    public let sessions: any HerdrSessionCoordinating
 
-    public init(desktop: any DesktopControlling, store: any AccountStoring, codex: any CodexIdentityReading) {
-        self.desktop = desktop; self.store = store; self.codex = codex
+    public init(desktop: any DesktopControlling, store: any AccountStoring,
+                codex: any CodexIdentityReading,
+                sessions: any HerdrSessionCoordinating = NoopHerdrCoordinator()) {
+        self.desktop = desktop; self.store = store; self.codex = codex; self.sessions = sessions
+    }
+
+    public func hasPendingSessionRecovery() async -> Bool { await sessions.hasPendingRecovery() }
+    public func recoverSessions() async throws {
+        let registry = try await store.loadRegistry()
+        guard let activeID = registry.activeAccountID,
+              let profile = registry.accounts.first(where: { $0.id == activeID }) else {
+            throw AccountStoreError.activeProfileMissing
+        }
+        let identity = try await codex.readIdentity(profileHome: await store.activeCodexHome())
+        guard identity.matches(profile) else { throw AccountStoreError.activeCredentialMismatch }
+        try await sessions.resume()
     }
 
     public func switchAccount(to targetID: UUID) async throws {
@@ -33,107 +55,100 @@ public struct SwitchService: SwitchServicing {
         } catch {
             throw OperationError.stage(.activateTargetCredential, error)
         }
-
         do {
             let registry = try await store.loadRegistry()
             originalActiveID = registry.activeAccountID
-            if let activeID = registry.activeAccountID {
+            if let activeID = originalActiveID {
                 guard let profile = registry.accounts.first(where: { $0.id == activeID }) else {
                     throw AccountStoreError.activeProfileMissing
                 }
                 originalProfile = profile
             } else {
-                guard await !store.activeCredentialExists() else {
-                    throw AccountStoreError.activeProfileMissing
-                }
+                guard await !store.activeCredentialExists() else { throw AccountStoreError.activeProfileMissing }
                 originalProfile = nil
             }
         } catch {
             throw OperationError.stage(.saveCurrentCredential, error)
         }
+        // Preflight all terminal sessions before closing anything or changing credentials.
+        do { try await sessions.prepare() }
+        catch { throw OperationError.stage(.prepareHerdr, error) }
 
+        var stage = SwitchStage.closeDesktop
+        var desktopClosed = false
+        var credentialMayHaveChanged = false
+        var committed = false
         do {
             try await desktop.closeDesktop()
-        } catch {
-            throw OperationError.stage(.closeDesktop, error)
-        }
-
-        do {
+            desktopClosed = true
+            stage = .suspendHerdr
+            try await sessions.suspend()
+            stage = .saveCurrentCredential
             if let originalProfile {
                 let identity = try await codex.readIdentity(profileHome: await store.activeCodexHome())
-                guard identity.matches(originalProfile) else {
-                    throw AccountStoreError.activeCredentialMismatch
-                }
+                guard identity.matches(originalProfile) else { throw AccountStoreError.activeCredentialMismatch }
                 try await store.saveCurrentCredential()
             } else if await store.activeCredentialExists() {
                 throw AccountStoreError.activeCredentialMismatch
             }
-        } catch {
-            throw OperationError.stage(.saveCurrentCredential, error)
-        }
-
-        do {
+            stage = .activateTargetCredential
+            credentialMayHaveChanged = true
             try await store.activateTargetCredential(id: targetID)
-        } catch {
-            throw OperationError.stage(.activateTargetCredential, error)
-        }
-
-        do {
+            stage = .verifyTargetIdentity
             let identity = try await codex.readIdentity(profileHome: await store.activeCodexHome())
-            guard identity.matches(target) else {
-                throw CodexClientError.identityUnavailable
-            }
-        } catch {
-            throw await restoringOriginalCredential(
-                originalActiveID: originalActiveID,
-                failedStage: .verifyTargetIdentity,
-                originalError: error
-            )
-        }
-
-        do {
+            guard identity.matches(target) else { throw CodexClientError.identityUnavailable }
+            stage = .commitActiveAccountID
             try await store.commitActiveAccountID(targetID)
-        } catch {
-            throw await restoringOriginalCredential(
-                originalActiveID: originalActiveID,
-                failedStage: .commitActiveAccountID,
-                originalError: error
-            )
-        }
-
-        do {
+            committed = true
+            stage = .resumeHerdr
+            try await sessions.resume()
+            stage = .reopenDesktop
             try await desktop.reopenDesktop()
         } catch {
-            throw OperationError.stage(.reopenDesktop, error)
-        }
-    }
-
-    private func restoringOriginalCredential(
-        originalActiveID: UUID?,
-        failedStage: SwitchStage,
-        originalError: any Error
-    ) async -> OperationError {
-        do {
-            if let originalActiveID {
-                try await store.restoreActiveCredential(id: originalActiveID)
-            } else {
-                try await store.clearActiveCredential()
+            let primaryError = error
+            var recoveryFailures: [String] = []
+            var credentialsSafe = true
+            if !committed && credentialMayHaveChanged {
+                do {
+                    if let originalActiveID, let originalProfile {
+                        try await store.restoreActiveCredential(id: originalActiveID)
+                        let identity = try await codex.readIdentity(profileHome: await store.activeCodexHome())
+                        guard identity.matches(originalProfile) else { throw AccountStoreError.activeCredentialMismatch }
+                    } else if await store.activeCredentialExists() {
+                        try await store.clearActiveCredential()
+                    }
+                } catch {
+                    credentialsSafe = false
+                    recoveryFailures.append("Restoring the previous credential failed: \(error.localizedDescription)")
+                }
             }
-            return OperationError.stage(failedStage, originalError)
-        } catch let restorationError {
-            return OperationError(
-                stage: failedStage,
-                titleKey: "switch_failed",
-                messageKey: nil,
-                message: """
-                \(originalError.localizedDescription) Restoring the previous credential also failed: \
-                \(restorationError.localizedDescription)
-                """,
-                underlyingDescription: """
-                \(String(describing: originalError)); restoration: \
-                \(String(describing: restorationError))
-                """
-            )
+            if !committed && credentialsSafe && desktopClosed {
+                do {
+                    if let originalProfile {
+                        let identity = try await codex.readIdentity(profileHome: await store.activeCodexHome())
+                        guard identity.matches(originalProfile) else { throw AccountStoreError.activeCredentialMismatch }
+                    } else if await store.activeCredentialExists() {
+                        throw AccountStoreError.activeCredentialMismatch
+                    }
+                } catch {
+                    credentialsSafe = false
+                    recoveryFailures.append("Confirm the current account before recovering Herdr chats: \(error.localizedDescription)")
+                }
+            }
+            if !committed && credentialsSafe {
+                do { try await sessions.resume() }
+                catch { recoveryFailures.append("Restoring Herdr sessions failed: \(error.localizedDescription)") }
+            }
+            // A post-commit Herdr failure keeps the selected account and its recovery journal.
+            // Still reopen Desktop so the result and recovery controls remain reachable.
+            if desktopClosed && stage != .reopenDesktop && credentialsSafe {
+                do { try await desktop.reopenDesktop() }
+                catch { recoveryFailures.append("Reopening Codex Desktop failed: \(error.localizedDescription)") }
+            }
+            if recoveryFailures.isEmpty { throw OperationError.stage(stage, primaryError) }
+            throw OperationError(stage: stage, titleKey: "switch_failed", messageKey: nil,
+                message: ([primaryError.localizedDescription] + recoveryFailures).joined(separator: "\n"),
+                underlyingDescription: String(describing: primaryError) + "; restoration: " + recoveryFailures.joined(separator: "; "))
         }
     }
 }

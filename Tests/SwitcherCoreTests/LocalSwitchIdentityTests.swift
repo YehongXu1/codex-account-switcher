@@ -68,7 +68,7 @@ struct LocalSwitchIdentityTests {
         #expect(try await fixture.store.loadRegistry().activeAccountID == fixture.original.id)
         #expect(try Data(contentsOf: fixture.active.appending(path: "auth.json")) == fixture.credential(fixture.original))
         #expect(try Data(contentsOf: targetHome.appending(path: "auth.json")) == Data(credential.utf8))
-        #expect(await fixture.desktop.calls == ["close"])
+        #expect(await fixture.desktop.calls == ["close", "open"])
     }
 
     @Test func missingCredentialFailsExplicitly() async throws {

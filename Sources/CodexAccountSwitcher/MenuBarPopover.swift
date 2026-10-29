@@ -20,6 +20,18 @@ struct MenuBarPopover: View {
                 Divider()
             }
 
+            if model.hasHerdrRecovery {
+                VStack(alignment: .leading, spacing: 6) {
+                    Text(model.text("herdr_recovery_body"))
+                        .font(.caption).foregroundStyle(.secondary)
+                    Button(model.text("herdr_recovery_button")) {
+                        Task { await model.recoverHerdrSessions() }
+                    }
+                    .disabled(model.isMutating || updater.isInstalling)
+                }.padding(10)
+                Divider()
+            }
+
             Group {
                 switch page {
                 case .accounts:
@@ -205,7 +217,7 @@ private struct SwitchConfirmationPage: View {
             Divider()
 
             VStack(alignment: .leading, spacing: 14) {
-                Text(model.text("switch_body"))
+                Text(model.text("switch_herdr_body"))
                     .font(.system(size: 11.5))
                     .foregroundStyle(.secondary)
                     .fixedSize(horizontal: false, vertical: true)

@@ -17,6 +17,7 @@ open class AccountController {
     public private(set) var isAddingAccount = false { didSet { onChange?() } }
     public var visibleError: OperationError? { didSet { onChange?() } }
     public private(set) var activeIdentityConfirmed = true { didSet { onChange?() } }
+    public private(set) var hasHerdrRecovery = false { didSet { onChange?() } }
 
     private let store: AccountStore
     private let codex: any AccountClient
@@ -63,6 +64,7 @@ open class AccountController {
         hasStarted = true
         isMutating = true
         defer { isMutating = false }
+        hasHerdrRecovery = await switchService.hasPendingSessionRecovery()
         do {
             settings = try await store.loadSettings()
             apply(try await store.loadRegistry())
@@ -203,28 +205,48 @@ open class AccountController {
             await refreshSubscriptionSnapshots()
             activeIdentityConfirmed = true
         } catch let error as OperationError {
-            if error.stage == .reopenDesktop {
+            if error.stage == .reopenDesktop || error.stage == .resumeHerdr {
                 do {
                     apply(try await store.loadRegistry())
                     activeIdentityConfirmed = true
                 } catch {
                     showError(error)
+                    hasHerdrRecovery = await switchService.hasPendingSessionRecovery()
                     return
                 }
                 visibleError = OperationError(
-                    stage: .reopenDesktop,
+                    stage: error.stage,
                     titleKey: "switched_reopen_title",
-                    messageKey: "switched_reopen_message",
-                    message: text("switched_reopen_message"),
+                    messageKey: error.stage == .reopenDesktop ? "switched_reopen_message" : nil,
+                    message: error.stage == .reopenDesktop ? text("switched_reopen_message") : error.message,
                     underlyingDescription: error.underlyingDescription
                 )
             } else {
-                if error.stage == .saveCurrentCredential { activeIdentityConfirmed = false }
+                if let stage = error.stage,
+                   [SwitchStage.saveCurrentCredential, .activateTargetCredential, .verifyTargetIdentity, .commitActiveAccountID].contains(stage) {
+                    activeIdentityConfirmed = false
+                }
                 visibleError = error
             }
         } catch {
             showError(error)
         }
+        hasHerdrRecovery = await switchService.hasPendingSessionRecovery()
+    }
+
+    public func recoverHerdrSessions() async {
+        guard !isMutating else { return }
+        isMutating = true
+        await cancelUsageRefresh()
+        defer { isMutating = false; refreshWeeklyUsage() }
+        do {
+            try await switchService.recoverSessions()
+            visibleError = nil
+        } catch {
+            activeIdentityConfirmed = false
+            showError(error)
+        }
+        hasHerdrRecovery = await switchService.hasPendingSessionRecovery()
     }
 
     public func addAccount() {

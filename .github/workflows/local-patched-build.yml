@@ -19,6 +19,15 @@ jobs:
         run: git diff --check HEAD~1 HEAD
       - name: Run Swift tests
         run: swift test
+      - name: Run core checks and build local handoff validation tool
+        run: |
+          ./scripts/run-core-checks.sh
+          install_name_tool -id @rpath/libSwitcherCore.dylib .build/core-checks/libSwitcherCore.dylib
+          swiftc -parse-as-library -I .build/core-checks -L .build/core-checks -lSwitcherCore -Xlinker -rpath -Xlinker @executable_path Checks/HerdrHandoffCheck.swift -o .build/core-checks/HerdrHandoffCheck
+          codesign --force --sign - .build/core-checks/libSwitcherCore.dylib .build/core-checks/HerdrHandoffCheck
+          mkdir herdr-validation
+          cp .build/core-checks/HerdrHandoffCheck .build/core-checks/libSwitcherCore.dylib herdr-validation/
+          ditto -c -k --keepParent herdr-validation herdr-validation.zip
       - name: Package local app
         env:
           SWIFT_BUILD_ARCH: arm64
@@ -28,7 +37,7 @@ jobs:
       - uses: actions/upload-artifact@v4
         with:
           name: patched-switcher-macos-arm64
-          path: patched-switcher.app.zip
+          path: |
+            patched-switcher.app.zip
+            herdr-validation.zip
           if-no-files-found: error
-      - name: Run core checks
-        run: ./scripts/run-core-checks.sh

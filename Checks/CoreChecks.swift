@@ -372,7 +372,7 @@ struct CoreChecks {
         )
         try await switcher.switchAccount(to: second.id)
         let recordedStages = await recorder.snapshot()
-        try require(recordedStages == SwitchStage.allCases, "switch stage order")
+        try require(recordedStages == [.closeDesktop, .saveCurrentCredential, .activateTargetCredential, .verifyTargetIdentity, .commitActiveAccountID, .reopenDesktop], "switch stage order")
 
         let fakeCodex = root.appending(path: "fake-codex")
         try createExecutable(at: fakeCodex, body: """

@@ -3,6 +3,9 @@ import Foundation
 import Testing
 
 
+private let desktopStages: [SwitchStage] = [.closeDesktop, .saveCurrentCredential,
+    .activateTargetCredential, .verifyTargetIdentity, .commitActiveAccountID, .reopenDesktop]
+
 struct SwitchServiceTests {
     @Test func quitFailureLeavesBothAccountsUntouched() async {
         let fixture = SwitchFixture(failure: .closeDesktop)
@@ -18,7 +21,7 @@ struct SwitchServiceTests {
 
         try await fixture.service.switchAccount(to: fixture.target.id)
 
-        #expect(await fixture.recorder.snapshot() == SwitchStage.allCases)
+        #expect(await fixture.recorder.snapshot() == desktopStages)
         #expect(await fixture.store.registryWasReadBeforeCredentialMutation())
         #expect(await fixture.store.credentialOwner() == fixture.target.id)
         #expect(await fixture.store.activeAccountID() == fixture.target.id)
@@ -26,7 +29,7 @@ struct SwitchServiceTests {
     }
 
     @Test func stopsAtTheFirstFailedStage() async {
-        for stage in SwitchStage.allCases {
+        for stage in desktopStages {
             let fixture = SwitchFixture(failure: stage)
             do {
                 try await fixture.service.switchAccount(to: fixture.target.id)
@@ -36,8 +39,10 @@ struct SwitchServiceTests {
             } catch {
                 Issue.record("Expected OperationError, got \(error)")
             }
-            let index = SwitchStage.allCases.firstIndex(of: stage)!
-            #expect(await fixture.recorder.snapshot() == Array(SwitchStage.allCases[...index]))
+            let index = desktopStages.firstIndex(of: stage)!
+            var expected = Array(desktopStages[...index])
+            if stage != .closeDesktop && stage != .reopenDesktop { expected.append(.reopenDesktop) }
+            #expect(await fixture.recorder.snapshot() == expected)
         }
     }
 
@@ -73,14 +78,14 @@ struct SwitchServiceTests {
         #expect(await fixture.store.restoredProfileIDs() == [fixture.original.id, fixture.original.id])
     }
 
-    @Test func activationFailureBeforeReplacementDoesNotRestore() async {
+    @Test func activationFailureRestoresOriginalBeforeReopening() async {
         let fixture = SwitchFixture(failure: .activateTargetCredential)
 
         await expectFailure(fixture, stage: .activateTargetCredential)
 
         #expect(await fixture.store.credentialOwner() == fixture.original.id)
         #expect(await fixture.store.activeAccountID() == fixture.original.id)
-        #expect(await fixture.store.restoredProfileIDs().isEmpty)
+        #expect(await fixture.store.restoredProfileIDs() == [fixture.original.id])
     }
 
     @Test func reopenFailureAfterCommitKeepsTargetAccount() async {
@@ -107,6 +112,54 @@ struct SwitchServiceTests {
         } catch {
             Issue.record("Expected OperationError, got \(error)")
         }
+    }
+
+    @Test func herdrChatsSurroundCredentialHandoff() async throws {
+        let fixture = SwitchFixture(failure: nil, withHerdr: true)
+        try await fixture.service.switchAccount(to: fixture.target.id)
+        #expect(await fixture.recorder.snapshot() == SwitchStage.allCases)
+        #expect(await fixture.sessions.resumedOwners() == [fixture.target.id])
+        #expect(await !fixture.service.hasPendingSessionRecovery())
+    }
+
+    @Test func unsafeHerdrPreflightDoesNotCloseDesktop() async {
+        let fixture = SwitchFixture(failure: .prepareHerdr, withHerdr: true)
+        await expectFailure(fixture, stage: .prepareHerdr)
+        #expect(await fixture.recorder.snapshot() == [.prepareHerdr])
+        #expect(await fixture.store.credentialOwner() == fixture.original.id)
+    }
+
+    @Test func partialHerdrQuitFailureResumesOriginalAccount() async {
+        let fixture = SwitchFixture(failure: .suspendHerdr, withHerdr: true)
+        await expectFailure(fixture, stage: .suspendHerdr)
+        #expect(await fixture.recorder.snapshot() == [.prepareHerdr, .closeDesktop, .suspendHerdr, .resumeHerdr, .reopenDesktop])
+        #expect(await fixture.sessions.resumedOwners() == [fixture.original.id])
+        #expect(await fixture.store.activeAccountID() == fixture.original.id)
+    }
+
+    @Test func verificationFailureRestoresAuthBeforeResumingChats() async {
+        let fixture = SwitchFixture(failure: .verifyTargetIdentity, withHerdr: true)
+        await expectFailure(fixture, stage: .verifyTargetIdentity)
+        #expect(await fixture.sessions.resumedOwners() == [fixture.original.id])
+    }
+
+    @Test func postCommitHerdrFailureKeepsTargetAndRecoveryJournal() async {
+        let fixture = SwitchFixture(failure: .resumeHerdr, withHerdr: true)
+        await expectFailure(fixture, stage: .resumeHerdr)
+        #expect(await fixture.store.activeAccountID() == fixture.target.id)
+        #expect(await fixture.service.hasPendingSessionRecovery())
+        #expect(await fixture.recorder.snapshot().last == .reopenDesktop)
+    }
+
+    @Test func manualRecoveryRejectsUnexpectedCredentialsAfterFailedRollback() async {
+        let fixture = SwitchFixture(failure: .verifyTargetIdentity, restoreFails: true, withHerdr: true)
+        await expectFailure(fixture, stage: .verifyTargetIdentity)
+        do {
+            try await fixture.service.recoverSessions()
+            Issue.record("Recovery must validate the committed account first")
+        } catch {}
+        #expect(await fixture.sessions.resumedOwners().isEmpty)
+        #expect(await fixture.service.hasPendingSessionRecovery())
     }
 
     private func expectFailure(_ fixture: SwitchFixture, stage: SwitchStage) async {
@@ -252,8 +305,9 @@ private struct SwitchFixture {
     let target: AccountProfile
     let store: FakeStore
     let service: SwitchService
+    let sessions: FakeSessions
 
-    init(failure: SwitchStage?, restoreFails: Bool = false) {
+    init(failure: SwitchStage?, restoreFails: Bool = false, withHerdr: Bool = false) {
         let original = AccountProfile(
             id: UUID(), displayName: "Original", email: "original@example.com",
             accountID: "original-id", createdAt: Date(), lastUsedAt: nil
@@ -272,10 +326,43 @@ private struct SwitchFixture {
             target: target
         )
         self.store = store
+        let sessions = FakeSessions(recorder: recorder, store: store, failure: failure)
+        self.sessions = sessions
+        let coordinator: any HerdrSessionCoordinating
+        if withHerdr { coordinator = sessions } else { coordinator = NoopHerdrCoordinator() }
         service = SwitchService(
             desktop: FakeDesktop(recorder: recorder, failure: failure),
             store: store,
-            codex: FakeCodex(recorder: recorder, failure: failure, store: store, target: target)
+            codex: FakeCodex(recorder: recorder, failure: failure, store: store, target: target),
+            sessions: coordinator
         )
     }
+}
+
+private actor FakeSessions: HerdrSessionCoordinating {
+    let recorder: CallRecorder
+    let store: FakeStore
+    let failure: SwitchStage?
+    var pending = false
+    var owners: [UUID] = []
+    init(recorder: CallRecorder, store: FakeStore, failure: SwitchStage?) {
+        self.recorder = recorder; self.store = store; self.failure = failure
+    }
+    func prepare() async throws {
+        await recorder.append(.prepareHerdr)
+        if failure == .prepareHerdr { throw InjectedFailure(stage: .prepareHerdr) }
+    }
+    func suspend() async throws {
+        pending = true
+        await recorder.append(.suspendHerdr)
+        if failure == .suspendHerdr { throw InjectedFailure(stage: .suspendHerdr) }
+    }
+    func resume() async throws {
+        await recorder.append(.resumeHerdr)
+        if failure == .resumeHerdr { throw InjectedFailure(stage: .resumeHerdr) }
+        owners.append(await store.credentialOwner())
+        pending = false
+    }
+    func hasPendingRecovery() async -> Bool { pending }
+    func resumedOwners() -> [UUID] { owners }
 }
