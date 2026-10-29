@@ -285,6 +285,7 @@ public actor HerdrCoordinator: HerdrSessionCoordinating {
             // A lost client response does not mean the submitted command failed.
             // The persisted state prevents any retry from submitting it a second time.
             try Task.checkCancellation()
+            if error is CancellationError { throw error }
         }
         try await confirmResumedRecord(index, record: record)
     }
@@ -293,7 +294,7 @@ public actor HerdrCoordinator: HerdrSessionCoordinating {
 
     /// Only failed observations may be retried; semantic identity checks stay outside
     /// this boundary so a replaced pane or a conflicting thread stops immediately.
-    private func recoveryProbe<T>(_ operation: () async throws -> T) async throws -> T {
+    private func recoveryProbe<T: Sendable>(_ operation: () async throws -> T) async throws -> T {
         do { return try await operation() }
         catch {
             try Task.checkCancellation()
