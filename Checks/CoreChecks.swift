@@ -650,8 +650,8 @@ struct CoreChecks {
         failureModel.refreshWeeklyUsage()
         await failureModel.waitForWeeklyUsageRefresh()
         try require(
-            failureModel.usageStates[first.id]?.displayedUsage?.remainingPercent == 44,
-            "failed refresh retains cached usage"
+            failureModel.usageStates[first.id]?.displayedUsage == nil,
+            "failed refresh does not revive an expired cached window"
         )
         try require(
             failureModel.usageStates[first.id]?.refreshError != nil,
