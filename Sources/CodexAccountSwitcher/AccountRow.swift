@@ -203,10 +203,17 @@ struct AccountRow: View {
         guard let subscription else {
             return L10n.string("subscription_unknown", language: language)
         }
+        if subscription.planType == "free" {
+            return L10n.string("subscription_free", language: language)
+        }
         let formatter = DateFormatter()
         formatter.locale = Locale(identifier: "en_US_POSIX")
         formatter.calendar = Calendar(identifier: .gregorian)
         formatter.dateFormat = "yyyy-MM-dd"
+        if let planType = subscription.planType {
+            return String(format: L10n.string("subscription_plan_until", language: language),
+                          planType.capitalized, formatter.string(from: subscription.activeUntil))
+        }
         return String(format: L10n.string("subscription_until", language: language),
                       formatter.string(from: subscription.activeUntil))
     }
@@ -218,6 +225,9 @@ struct AccountRow: View {
         let checked = subscription.lastChecked.formatted(
             .dateTime.year().month().day().hour().minute().locale(dateLocale)
         )
+        if subscription.planType == "free" {
+            return String(format: L10n.string("subscription_free_detail", language: language), checked)
+        }
         return String(format: L10n.string("subscription_detail", language: language), checked)
     }
 

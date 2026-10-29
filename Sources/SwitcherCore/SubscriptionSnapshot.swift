@@ -5,10 +5,12 @@ import Foundation
 public struct SubscriptionSnapshot: Equatable, Sendable, Encodable {
     public let activeUntil: Date
     public let lastChecked: Date
+    public let planType: String?
 
-    public init(activeUntil: Date, lastChecked: Date) {
+    public init(activeUntil: Date, lastChecked: Date, planType: String? = nil) {
         self.activeUntil = activeUntil
         self.lastChecked = lastChecked
+        self.planType = planType
     }
 }
 
@@ -38,14 +40,19 @@ public enum SubscriptionSnapshotReader {
            tokenEmail.caseInsensitiveCompare(expectedEmail) != .orderedSame {
             return nil
         }
-        if (account["chatgpt_plan_type"] as? String)?.lowercased() == "free" { return nil }
-
         guard let untilText = account["chatgpt_subscription_active_until"] as? String,
               let checkedText = account["chatgpt_subscription_last_checked"] as? String,
               let activeUntil = parseDate(untilText),
               let lastChecked = parseDate(checkedText)
         else { return nil }
-        return SubscriptionSnapshot(activeUntil: activeUntil, lastChecked: lastChecked)
+        let planType = (account["chatgpt_plan_type"] as? String)?
+            .trimmingCharacters(in: .whitespacesAndNewlines)
+            .lowercased()
+        return SubscriptionSnapshot(
+            activeUntil: activeUntil,
+            lastChecked: lastChecked,
+            planType: planType.flatMap { $0.isEmpty ? nil : $0 }
+        )
     }
 
     private static func decodePayload(_ token: String) -> [String: Any]? {

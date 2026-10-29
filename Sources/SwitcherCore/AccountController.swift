@@ -418,8 +418,18 @@ open class AccountController {
 
     private func apply(_ cache: UsageCache) {
         let validAccountIDs = Set(accounts.map(\.id))
+        let now = Date()
         for entry in cache.entries where validAccountIDs.contains(entry.profileID) {
-            usageStates[entry.profileID] = .loaded(entry.usage)
+            let age = now.timeIntervalSince(entry.fetchedAt)
+            if entry.usage.resetsAt <= now {
+                usageStates[entry.profileID] = .unavailable(text("usage_cache_expired"))
+            } else if age > 24 * 60 * 60 {
+                usageStates[entry.profileID] = .unavailable(text("usage_cache_outdated"))
+            } else if age > 15 * 60 {
+                usageStates[entry.profileID] = .stale(entry.usage, text("usage_cache_stale"))
+            } else {
+                usageStates[entry.profileID] = .loaded(entry.usage)
+            }
         }
     }
 

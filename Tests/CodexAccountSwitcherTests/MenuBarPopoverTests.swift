@@ -7,14 +7,14 @@ import SwitcherCore
 @MainActor
 struct MenuBarPopoverTests {
     @Test(arguments: [false, true])
-    func accountHeightIsIndependentOfPreviousPageAndCappedAtThreeRows(
+    func accountHeightIsIndependentOfPreviousPageAndCappedAtFiveRows(
         expandedUsage: Bool
     ) async throws {
         let root = FileManager.default.temporaryDirectory
             .appending(path: "popover-layout-\(UUID())")
         defer { try? FileManager.default.removeItem(at: root) }
         var heights: [Int: CGFloat] = [:]
-        for count in [0, 1, 2, 3, 4, 20] {
+        for count in [0, 1, 2, 3, 4, 5, 6, 20] {
             let model = try await makeModel(root: root.appending(path: "\(count)"), accountCount: count)
             await model.setShowsFiveHourUsage(expandedUsage)
             let updater = AppUpdater()
@@ -40,11 +40,15 @@ struct MenuBarPopoverTests {
         let one = try #require(heights[1])
         let two = try #require(heights[2])
         let three = try #require(heights[3])
+        let four = try #require(heights[4])
+        let five = try #require(heights[5])
         #expect(one > empty)
         #expect(two > one)
         #expect(three > two)
-        #expect(heights[4] == three)
-        #expect(heights[20] == three)
+        #expect(four > three)
+        #expect(five > four)
+        #expect(heights[6] == five)
+        #expect(heights[20] == five)
     }
 
     private func makeModel(root: URL, accountCount: Int) async throws -> AppModel {

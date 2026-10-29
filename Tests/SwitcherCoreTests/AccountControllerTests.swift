@@ -131,6 +131,40 @@ struct AccountControllerTests {
         #expect(try await fixture.store.loadUsageCache().entries.first?.usage.remainingPercent == 72)
     }
 
+    @Test func expiredCachedUsageIsNotPresentedAsCurrent() async throws {
+        let fixture = try ControllerFixture()
+        defer { fixture.clean() }
+        try fixture.writeActiveCredential()
+        let registry = try await fixture.store.syncActiveCredential()
+        let id = try #require(registry.activeAccountID)
+        try await fixture.store.cacheWeeklyUsage(
+            WeeklyUsage(remainingPercent: 100, resetsAt: Date().addingTimeInterval(-60)),
+            profileID: id, fetchedAt: Date().addingTimeInterval(-3600)
+        )
+        await fixture.model.start()
+        #expect(fixture.model.usageStates[id]?.displayedUsage == nil)
+        #expect(fixture.model.usageStates[id] == .unavailable(
+            L10n.string("usage_cache_expired", language: .system)
+        ))
+    }
+
+    @Test func dayOldCachedUsageIsNotPresentedAsCurrent() async throws {
+        let fixture = try ControllerFixture()
+        defer { fixture.clean() }
+        try fixture.writeActiveCredential()
+        let registry = try await fixture.store.syncActiveCredential()
+        let id = try #require(registry.activeAccountID)
+        try await fixture.store.cacheWeeklyUsage(
+            WeeklyUsage(remainingPercent: 100, resetsAt: Date().addingTimeInterval(86_400)),
+            profileID: id, fetchedAt: Date().addingTimeInterval(-2 * 86_400)
+        )
+        await fixture.model.start()
+        #expect(fixture.model.usageStates[id]?.displayedUsage == nil)
+        #expect(fixture.model.usageStates[id] == .unavailable(
+            L10n.string("usage_cache_outdated", language: .system)
+        ))
+    }
+
     @Test func settingsAreSavedImmediately() async throws {
         let fixture = try ControllerFixture()
         defer { fixture.clean() }

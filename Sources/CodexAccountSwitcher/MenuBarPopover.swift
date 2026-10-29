@@ -87,11 +87,11 @@ struct MenuBarPopover: View {
                     .padding(.vertical, 28)
             } else {
                 Group {
-                    if model.accounts.count <= 3 {
+                    if model.accounts.count <= 5 {
                         accountList(model.accounts)
                     } else {
-                        // The first three rows determine the viewport's intrinsic height.
-                        accountList(Array(model.accounts.prefix(3)))
+                        // Show five accounts before scrolling, including the full local list in common use.
+                        accountList(Array(model.accounts.prefix(5)))
                             .hidden()
                             .overlay {
                                 ScrollView { accountList(model.accounts) }

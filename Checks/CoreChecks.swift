@@ -177,6 +177,7 @@ struct CoreChecks {
         let iso = ISO8601DateFormatter()
         try require(subscription?.activeUntil == iso.date(from: "2026-10-17T12:00:00Z"), "saved subscription date")
         try require(subscription?.lastChecked == iso.date(from: "2026-10-03T12:00:00Z"), "saved subscription check time")
+        try require(subscription?.planType == "plus", "saved plan type")
         try require(SubscriptionSnapshotReader.read(
             credential: credential, expectedAccountID: "other-account", expectedEmail: "a@example.com"
         ) == nil, "subscription cannot cross account IDs")
@@ -189,7 +190,7 @@ struct CoreChecks {
         let freeCredential = try testCredential(plan: "free")
         try require(SubscriptionSnapshotReader.read(
             credential: freeCredential, expectedAccountID: "account-a", expectedEmail: nil
-        ) == nil, "free login has no membership date")
+        )?.planType == "free", "free login keeps its plan label")
         let missingDateCredential = try testCredential(activeUntil: nil)
         try require(SubscriptionSnapshotReader.read(
             credential: missingDateCredential, expectedAccountID: "account-a", expectedEmail: nil
