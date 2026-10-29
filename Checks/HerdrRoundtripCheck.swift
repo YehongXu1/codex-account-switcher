@@ -95,7 +95,14 @@ struct HerdrRoundtripCheck {
             report["status"] = "failed"
             report["timestamp"] = timestamp()
             report["errorType"] = String(reflecting: type(of: error))
-            if let error = error as? OperationError { report["errorStage"] = error.stage?.rawValue }
+            if let error = error as? OperationError {
+                report["errorStage"] = error.stage?.rawValue
+                // Handoff stages only emit coordinator/desktop diagnostics, not auth RPC bodies.
+                if let stage = error.stage, [.prepareHerdr, .suspendHerdr, .resumeHerdr].contains(stage) {
+                    report["handoffDiagnostic"] = error.message
+                }
+            }
+            if let error = error as? HerdrCoordinatorError { report["handoffDiagnostic"] = error.localizedDescription }
             if let error = error as? CheckError { report["errorCategory"] = error.rawValue }
             report["pendingRecovery"] = await service.hasPendingSessionRecovery()
             // Report the actual post-failure state; an error after commit can keep the target active.

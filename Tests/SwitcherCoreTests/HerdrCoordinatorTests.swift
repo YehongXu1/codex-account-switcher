@@ -83,12 +83,9 @@ struct HerdrCoordinatorTests {
         try await fixture.coordinator.prepare()
         try await fixture.coordinator.suspend()
         await fixture.runner.loseNextResumeResponse()
-        await #expect(throws: (any Error).self) { try await fixture.coordinator.resume() }
-        // Simulate application restart: recover using only the saved journal.
-        let restarted = fixture.makeCoordinator()
-        try await restarted.resume()
+        try await fixture.coordinator.resume()
         #expect(await fixture.runner.starts().count == 1)
-        #expect(!(await restarted.hasPendingRecovery()))
+        #expect(!(await fixture.coordinator.hasPendingRecovery()))
     }
 
     @Test func replacementConversationIsNeverOverwritten() async throws {
@@ -141,9 +138,76 @@ struct HerdrCoordinatorTests {
         try await fixture.coordinator.suspend()
         await fixture.runner.hideSessionMetadata()
         await fixture.runner.loseNextResumeResponse()
-        await #expect(throws: (any Error).self) { try await fixture.coordinator.resume() }
-        try await fixture.makeCoordinator().resume()
+        try await fixture.coordinator.resume()
         #expect(await fixture.runner.starts().count == 1)
+    }
+
+    @Test(arguments: ["pane", "process", "lsof", "environment"])
+    func temporaryStartupObservationFailureConvergesWithoutDuplicateLaunch(_ probe: String) async throws {
+        let fixture = try Fixture()
+        defer { fixture.clean() }
+        try await fixture.coordinator.prepare()
+        try await fixture.coordinator.suspend()
+        await fixture.runner.failStartupProbe(probe)
+        try await fixture.coordinator.resume()
+        #expect(await fixture.runner.starts().count == 1)
+        #expect(!(await fixture.coordinator.hasPendingRecovery()))
+    }
+
+    @Test func delayedOpenRolloutWithNoHookConverges() async throws {
+        let fixture = try Fixture()
+        defer { fixture.clean() }
+        try await fixture.coordinator.prepare()
+        try await fixture.coordinator.suspend()
+        await fixture.runner.hideSessionMetadata()
+        await fixture.runner.delayRuntimeFile(probes: 2)
+        try await fixture.coordinator.resume()
+        #expect(await fixture.runner.starts().count == 1)
+        #expect(!(await fixture.coordinator.hasPendingRecovery()))
+    }
+
+    @Test func savedResumingStateWaitsForQueuedLaunchWithoutResubmitting() async throws {
+        let fixture = try Fixture()
+        defer { fixture.clean() }
+        try await fixture.coordinator.prepare()
+        try await fixture.coordinator.suspend()
+        await fixture.runner.delayNextLaunch(polls: 4)
+        await fixture.runner.loseNextResumeResponse()
+        await #expect(throws: (any Error).self) { try await fixture.coordinator.resume() }
+        #expect(await fixture.coordinator.hasPendingRecovery())
+        let restarted = fixture.makeCoordinator()
+        try await restarted.resume()
+        #expect(await fixture.runner.starts().count == 1)
+        #expect(!(await restarted.hasPendingRecovery()))
+    }
+
+    @Test func savedResumingStateWaitsForRuntimeIdentity() async throws {
+        let fixture = try Fixture()
+        defer { fixture.clean() }
+        try await fixture.coordinator.prepare()
+        try await fixture.coordinator.suspend()
+        await fixture.runner.hideSessionMetadata()
+        await fixture.runner.delayRuntimeFile(probes: 4)
+        await #expect(throws: (any Error).self) { try await fixture.coordinator.resume() }
+        #expect(await fixture.coordinator.hasPendingRecovery())
+        let restarted = fixture.makeCoordinator()
+        try await restarted.resume()
+        #expect(await fixture.runner.starts().count == 1)
+        #expect(!(await restarted.hasPendingRecovery()))
+    }
+
+    @Test(arguments: [false, true])
+    func conflictingRuntimeIdentityDuringStartupRemainsBlocking(_ ambiguous: Bool) async throws {
+        let fixture = try Fixture()
+        defer { fixture.clean() }
+        try await fixture.coordinator.prepare()
+        try await fixture.coordinator.suspend()
+        await fixture.runner.hideSessionMetadata()
+        await fixture.runner.setRuntimeThreads(ambiguous ? [fixture.ids[0], UUID().uuidString] : [UUID().uuidString])
+        await #expect(throws: (any Error).self) { try await fixture.coordinator.resume() }
+        await #expect(throws: (any Error).self) { try await fixture.makeCoordinator().resume() }
+        #expect(await fixture.runner.starts().count == 1)
+        #expect(await fixture.coordinator.hasPendingRecovery())
     }
 
     @Test func mismatchedOrAmbiguousRuntimeThreadsBlockBeforeQuit() async throws {
@@ -255,6 +319,10 @@ private actor FakeHerdr: HerdrCommandRunning {
     private var shellPrompt = "fixture@host repo %"
     private var metadataHidden = false
     private var runtimeThreads: [String]?
+    private var failedStartupProbe: String?
+    private var runtimeFileDelay = 0
+    private var launchDelay = 0
+    private var queuedLaunch: (index: Int, polls: Int)?
     private var composer = "› Ask Codex to do anything\nGPT-6-Sol low · ~/repo"
     init(home: String, ids: [String]) {
         self.home = home
@@ -271,6 +339,9 @@ private actor FakeHerdr: HerdrCommandRunning {
     func setShellPrompt(_ value: String) { shellPrompt = value }
     func hideSessionMetadata() { metadataHidden = true }
     func setRuntimeThreads(_ values: [String]) { runtimeThreads = values }
+    func failStartupProbe(_ name: String) { failedStartupProbe = name }
+    func delayRuntimeFile(probes: Int) { runtimeFileDelay = probes }
+    func delayNextLaunch(polls: Int) { launchDelay = polls }
     func startDifferentThread(_ pane: String) {
         let index = agents.firstIndex { $0.pane == pane }!
         agents[index].shell = false; agents[index].pid += 500; agents[index].thread = UUID().uuidString
@@ -280,10 +351,15 @@ private actor FakeHerdr: HerdrCommandRunning {
     func starts() -> [String] { launchCommands }
 
     func run(_ executable: URL, _ arguments: [String]) async throws -> String {
-        if executable.path == "/bin/ps" { return "codex HOME=/test CODEX_HOME=\(home) USER=test" }
+        if executable.path == "/bin/ps" {
+            try failProbeIfRequested("environment")
+            return "codex HOME=/test CODEX_HOME=\(home) USER=test"
+        }
         if executable.path == "/usr/sbin/lsof" {
+            try failProbeIfRequested("lsof")
             let pid = Int(arguments[3])!
             let agent = agents.first { $0.pid == pid }!
+            if agent.resumedByCoordinator, runtimeFileDelay > 0 { runtimeFileDelay -= 1; return "p\(pid)\n" }
             return (runtimeThreads ?? [agent.thread]).map {
                 "n\(home)/sessions/2026/10/29/rollout-2026-10-29T12-00-00-\($0).jsonl"
             }.joined(separator: "\n")
@@ -294,10 +370,16 @@ private actor FakeHerdr: HerdrCommandRunning {
             return try json(["result": ["snapshot": ["panes": agents.map(paneJSON)]]])
         }
         if args[0...1] == ["pane", "get"] {
+            if let queued = queuedLaunch {
+                if queued.polls == 0 { finishLaunch(queued.index); queuedLaunch = nil }
+                else { queuedLaunch = (queued.index, queued.polls - 1) }
+            }
+            try failProbeIfRequested("pane")
             let a = agents.first { $0.pane == args[2] }!
             return try json(["result": ["pane": paneJSON(a)]])
         }
         if args[0...1] == ["pane", "process-info"] {
+            try failProbeIfRequested("process")
             let a = agents.first { $0.pane == args[3] }!
             let argv = a.resumedByCoordinator
                 ? ["/test/codex", "--no-daemon", "-C", home, "resume", a.thread] + extraArguments
@@ -333,12 +415,22 @@ private actor FakeHerdr: HerdrCommandRunning {
         if args[0...1] == ["pane", "run"] {
             let i = agents.firstIndex { $0.pane == args[2] }!
             operations.append("resume:\(args[2])"); launchCommands.append(args[3])
-            agents[i].shell = false; agents[i].pid += 500; agents[i].resumedByCoordinator = true
+            if launchDelay > 0 { queuedLaunch = (i, launchDelay); launchDelay = 0 }
+            else { finishLaunch(i) }
             if loseResume { loseResume = false; throw HerdrCoordinatorError.failure("injected lost response") }
             return "{}"
         }
         Issue.record("Unexpected command \(args)")
         throw HerdrCoordinatorError.failure("unexpected command")
+    }
+    private func finishLaunch(_ index: Int) {
+        agents[index].shell = false; agents[index].pid += 500; agents[index].resumedByCoordinator = true
+    }
+    private func failProbeIfRequested(_ name: String) throws {
+        if failedStartupProbe == name, agents.contains(where: { $0.resumedByCoordinator }) {
+            failedStartupProbe = nil
+            throw HerdrCoordinatorError.failure("injected temporary observation failure")
+        }
     }
     private func paneJSON(_ a: Agent) -> [String: Any] {
         var result: [String: Any] = ["pane_id": a.pane, "terminal_id": a.terminal, "cwd": home, "foreground_cwd": home]

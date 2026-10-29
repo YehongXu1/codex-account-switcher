@@ -243,6 +243,10 @@ public actor HerdrCoordinator: HerdrSessionCoordinating {
         guard let record = journal?.records[index] else { return }
         // Nothing was sent to this pane, so cancellation has nothing to undo.
         if record.state == .prepared || record.state == .resumed { return }
+        if record.state == .resuming {
+            try await confirmResumedRecord(index, record: record)
+            return
+        }
         let current = try await pane(record.paneID)
         try sameTerminal(current, record)
         let info = try await processInfo(record.paneID)
@@ -268,9 +272,6 @@ public actor HerdrCoordinator: HerdrSessionCoordinating {
         guard info.isShellOnly else {
             throw failure("\(record.paneID) 当前有其他程序，未自动输入恢复命令。")
         }
-        guard record.state != .resuming else {
-            throw failure("\(record.paneID) 已发送过恢复命令但未确认成功；请在该窗口运行 codex --no-daemon resume \(record.threadID)，然后重试恢复。")
-        }
         let shellText = Self.readText(try await command(["pane", "read", record.paneID, "--source", "visible", "--lines", "20"]))
         guard Self.hasEmptyShellPrompt(shellText) else {
             throw failure("\(record.paneID) 的 shell 有未发送输入或提示符无法确认，请回到空提示符后重试恢复。")
@@ -279,31 +280,60 @@ public actor HerdrCoordinator: HerdrSessionCoordinating {
         try persist()
         let line = Self.resumeCommand(executable: record.executable, home: record.codexHome,
                                       cwd: record.cwd, threadID: record.threadID)
-        _ = try await command(["pane", "run", record.paneID, line])
+        do { _ = try await command(["pane", "run", record.paneID, line]) }
+        catch {
+            // A lost client response does not mean the submitted command failed.
+            // The persisted state prevents any retry from submitting it a second time.
+            try Task.checkCancellation()
+        }
+        try await confirmResumedRecord(index, record: record)
+    }
+
+    private struct RecoveryProbeUnavailable: Error {}
+
+    /// Only failed observations may be retried; semantic identity checks stay outside
+    /// this boundary so a replaced pane or a conflicting thread stops immediately.
+    private func recoveryProbe<T>(_ operation: () async throws -> T) async throws -> T {
+        do { return try await operation() }
+        catch {
+            try Task.checkCancellation()
+            if error is CancellationError { throw error }
+            throw RecoveryProbeUnavailable()
+        }
+    }
+
+    private func confirmResumedRecord(_ index: Int, record: Record) async throws {
+        let deadline = ContinuousClock.now.advanced(by: .seconds(30))
         for _ in 0..<pollAttempts {
-            let pane = try await pane(record.paneID)
-            try sameTerminal(pane, record)
-            let process = try await processInfo(record.paneID)
-            if pane.agent == "codex", let running = process.foregroundProcesses.first(where: { $0.isCodex }),
-               running.pid != record.pid, pane.isReady,
-               let actual = try await threadID(pane: pane, process: running) {
-                guard actual == record.threadID else {
-                    throw failure("\(record.paneID) 的对话 ID 与原记录不一致，请在窗口中检查。")
+            try Task.checkCancellation()
+            guard ContinuousClock.now < deadline else { break }
+            do {
+                let pane = try await recoveryProbe { try await self.pane(record.paneID) }
+                try sameTerminal(pane, record)
+                let info = try await recoveryProbe { try await processInfo(record.paneID) }
+                if let running = info.foregroundProcesses.first(where: { $0.isCodex }) {
+                    let actual = try await threadID(pane: pane, process: running, duringRecovery: true)
+                    if let actual, actual != record.threadID {
+                        throw failure("\(record.paneID) 的对话 ID 与原记录不一致，请在窗口中检查。")
+                    }
+                    if actual != nil, running.pid != record.pid, pane.agent == "codex", pane.isReady {
+                        try await verifyFreshProcess(running, record: record, duringRecovery: true)
+                        journal?.records[index].state = .resumed
+                        try persist()
+                        return
+                    }
                 }
-                try await verifyFreshProcess(running, record: record)
-                journal?.records[index].state = .resumed
-                try persist()
-                return
-            }
+            } catch is RecoveryProbeUnavailable { /* The next observation may see the completed startup. */ }
+            guard ContinuousClock.now < deadline else { break }
             try await Task.sleep(for: pollDelay)
         }
-        throw failure("\(record.paneID) 的恢复尚未确认；原对话记录仍在，请在窗口中查看提示后重试恢复。")
+        throw failure("\(record.paneID) 已发送恢复命令，但启动状态尚未确认；原对话记录仍在，请在窗口中查看提示后重试恢复。不会重复发送启动命令。")
     }
 
     /// Herdr's SessionStart hook can be absent after resume. An open rollout file
     /// identifies the loaded conversation even if `/resume` changed it since launch.
     /// Only descriptor paths are read; transcript contents are never inspected.
-    private func threadID(pane: Pane, process: ForegroundProcess) async throws -> String? {
+    private func threadID(pane: Pane, process: ForegroundProcess, duringRecovery: Bool = false) async throws -> String? {
         let reported: String?
         if let session = pane.agentSession {
             guard session.agent == "codex", session.kind == "id", let id = UUID(uuidString: session.value) else {
@@ -311,7 +341,14 @@ public actor HerdrCoordinator: HerdrSessionCoordinating {
             }
             reported = id.uuidString.lowercased()
         } else { reported = nil }
-        let files = try await runner.run(URL(fileURLWithPath: "/usr/sbin/lsof"), ["-nP", "-a", "-p", String(process.pid), "-Fn"])
+        let files: String
+        if duringRecovery {
+            files = try await recoveryProbe {
+                try await runner.run(URL(fileURLWithPath: "/usr/sbin/lsof"), ["-nP", "-a", "-p", String(process.pid), "-Fn"])
+            }
+        } else {
+            files = try await runner.run(URL(fileURLWithPath: "/usr/sbin/lsof"), ["-nP", "-a", "-p", String(process.pid), "-Fn"])
+        }
         let runtimeIDs = Self.runtimeThreadIDs(from: files, home: activeHome)
         guard runtimeIDs.count <= 1 else {
             throw failure("\(pane.paneID) 同时打开了多条对话记录，无法确认应恢复哪一条。")
@@ -344,12 +381,19 @@ public actor HerdrCoordinator: HerdrSessionCoordinating {
         return result
     }
 
-    private func verifyFreshProcess(_ process: ForegroundProcess, record: Record) async throws {
+    private func verifyFreshProcess(_ process: ForegroundProcess, record: Record, duringRecovery: Bool = false) async throws {
         guard process.argv.contains("--no-daemon"), process.cwd == record.cwd,
               Self.supportsArguments(Array(process.argv.dropFirst()), cwd: record.cwd, threadID: record.threadID) else {
             throw failure("\(record.paneID) 的恢复进程未使用预期的独立运行方式或目录，请检查窗口。")
         }
-        let environment = try await runner.run(URL(fileURLWithPath: "/bin/ps"), ["eww", "-p", String(process.pid), "-o", "command="])
+        let environment: String
+        if duringRecovery {
+            environment = try await recoveryProbe {
+                try await runner.run(URL(fileURLWithPath: "/bin/ps"), ["eww", "-p", String(process.pid), "-o", "command="])
+            }
+        } else {
+            environment = try await runner.run(URL(fileURLWithPath: "/bin/ps"), ["eww", "-p", String(process.pid), "-o", "command="])
+        }
         let home = Self.codexHome(from: environment, defaultHome: FileManager.default.homeDirectoryForCurrentUser.appendingPathComponent(".codex").path)
         guard URL(fileURLWithPath: home).standardizedFileURL.resolvingSymlinksInPath()
             == URL(fileURLWithPath: record.codexHome).standardizedFileURL.resolvingSymlinksInPath() else {
