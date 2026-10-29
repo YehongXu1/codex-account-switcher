@@ -24,9 +24,11 @@ jobs:
           ./scripts/run-core-checks.sh
           install_name_tool -id @rpath/libSwitcherCore.dylib .build/core-checks/libSwitcherCore.dylib
           swiftc -parse-as-library -I .build/core-checks -L .build/core-checks -lSwitcherCore -Xlinker -rpath -Xlinker @executable_path Checks/HerdrHandoffCheck.swift -o .build/core-checks/HerdrHandoffCheck
-          codesign --force --sign - .build/core-checks/libSwitcherCore.dylib .build/core-checks/HerdrHandoffCheck
+          swiftc -parse-as-library -I .build/core-checks -L .build/core-checks -lSwitcherCore -Xlinker -rpath -Xlinker @executable_path Sources/CodexAccountSwitcher/DesktopController.swift Checks/HerdrRoundtripCheck.swift -framework AppKit -o .build/core-checks/HerdrRoundtripCheck
+          codesign --force --sign - .build/core-checks/libSwitcherCore.dylib .build/core-checks/HerdrHandoffCheck .build/core-checks/HerdrRoundtripCheck
           mkdir herdr-validation
           cp .build/core-checks/HerdrHandoffCheck .build/core-checks/libSwitcherCore.dylib herdr-validation/
+          cp .build/core-checks/HerdrRoundtripCheck herdr-validation/
           ditto -c -k --keepParent herdr-validation herdr-validation.zip
       - name: Package local app
         env:
