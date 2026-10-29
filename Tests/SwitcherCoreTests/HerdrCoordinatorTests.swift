@@ -48,10 +48,10 @@ struct HerdrCoordinatorTests {
     @Test func missingThreadOrDraftNeverGetsSubmitted() async throws {
         let fixture = try Fixture()
         defer { fixture.clean() }
-        await fixture.runner.setComposer("› unfinished user request\nGPT-6-Sol low")
+        await fixture.runner.setComposer("› unfinished user request\nGPT-6-Sol low · ~/repo")
         await #expect(throws: (any Error).self) { try await fixture.coordinator.prepare() }
         #expect(await fixture.runner.mutations().isEmpty)
-        await fixture.runner.setComposer("› Ask Codex to do anything\nGPT-6-Sol low")
+        await fixture.runner.setComposer("› Ask Codex to do anything\nGPT-6-Sol low · ~/repo")
         await fixture.runner.setThread("w1:p1", "unknown")
         await #expect(throws: (any Error).self) { try await fixture.coordinator.prepare() }
         #expect(await fixture.runner.mutations().isEmpty)
@@ -114,11 +114,25 @@ struct HerdrCoordinatorTests {
     @Test func knownSelectionWithEmptyComposerIsClearedAndRechecked() async throws {
         let fixture = try Fixture()
         defer { fixture.clean() }
-        await fixture.runner.setComposer("› Ask Codex to do anything\nGPT-6-Sol low\n⌃c copy · enter copy & follow · esc clear")
+        await fixture.runner.setComposer("› Ask Codex to do anything\nGPT-6-Sol low · ~/repo\n⌃c copy · enter copy & follow · esc clear")
         try await fixture.coordinator.prepare()
         try await fixture.coordinator.suspend()
         #expect(await fixture.runner.mutations() == ["esc:w1:p1", "quit:w1:p1"])
         try await fixture.coordinator.resume()
+    }
+
+    @Test func shellDraftPreventsAutomaticResumeInput() async throws {
+        let fixture = try Fixture()
+        defer { fixture.clean() }
+        try await fixture.coordinator.prepare()
+        try await fixture.coordinator.suspend()
+        await fixture.runner.setShellPrompt("fixture@host repo % unfinished command")
+        await #expect(throws: (any Error).self) { try await fixture.coordinator.resume() }
+        #expect(await fixture.runner.starts().isEmpty)
+        #expect(await fixture.coordinator.hasPendingRecovery())
+        await fixture.runner.setShellPrompt("fixture@host repo %")
+        try await fixture.coordinator.resume()
+        #expect(await fixture.runner.starts().count == 1)
     }
 
     @Test func unknownLaunchArgumentsAreNotSilentlyDropped() async throws {
@@ -131,9 +145,13 @@ struct HerdrCoordinatorTests {
 
     @Test func composerAndEnvironmentParsingAreConservative() {
         #expect(HerdrCoordinator.hasEmptyComposer("› Ask Codex to do anything\n\nGPT-6-Sol low · ~/repo"))
-        #expect(!HerdrCoordinator.hasEmptyComposer("› \n  a multiline draft\nGPT-6-Sol low"))
+        #expect(!HerdrCoordinator.hasEmptyComposer("› \n  a multiline draft\nGPT-6-Sol low · ~/repo"))
         #expect(!HerdrCoordinator.hasEmptyComposer("› Ask Codex to do anything\n⌃c copy · enter copy & follow · esc clear"))
         #expect(!HerdrCoordinator.hasEmptyComposer("› /quit"))
+        #expect(!HerdrCoordinator.hasEmptyComposer("› \nGPT-6-Sol low · draft text\nGPT-6-Sol low · ~/repo"))
+        #expect(HerdrCoordinator.hasEmptyShellPrompt("(base) xyh@MacBook repo %"))
+        #expect(!HerdrCoordinator.hasEmptyShellPrompt("(base) xyh@MacBook repo % echo something %"))
+        #expect(!HerdrCoordinator.hasEmptyShellPrompt("custom prompt > "))
         #expect(HerdrCoordinator.codexHome(from: "codex resume x HOME=/Users/test CODEX_HOME=/a path/codex USER=test", defaultHome: "/fallback") == "/a path/codex")
         let command = HerdrCoordinator.resumeCommand(executable: "/bin/codex", home: "/home/a'b", cwd: "/work/$(touch nope)", threadID: "thread-id")
         #expect(command.contains("'/home/a'\\''b'"))
@@ -179,7 +197,8 @@ private actor FakeHerdr: HerdrCommandRunning {
     private var loseResume = false
     private var lateAgent = false
     private var extraArguments: [String] = []
-    private var composer = "› Ask Codex to do anything\nGPT-6-Sol low"
+    private var shellPrompt = "fixture@host repo %"
+    private var composer = "› Ask Codex to do anything\nGPT-6-Sol low · ~/repo"
     init(home: String, ids: [String]) {
         self.home = home
         agents = ids.enumerated().map { Agent(pane: "w1:p\($0.offset + 1)", terminal: "terminal-\($0.offset)", thread: $0.element, pid: 100 + $0.offset) }
@@ -192,6 +211,7 @@ private actor FakeHerdr: HerdrCommandRunning {
     func loseNextResumeResponse() { loseResume = true }
     func addAgentAfterQuit() { lateAgent = true }
     func setExtraArguments(_ values: [String]) { extraArguments = values }
+    func setShellPrompt(_ value: String) { shellPrompt = value }
     func startDifferentThread(_ pane: String) {
         let index = agents.firstIndex { $0.pane == pane }!
         agents[index].shell = false; agents[index].pid += 500; agents[index].thread = UUID().uuidString
@@ -221,6 +241,7 @@ private actor FakeHerdr: HerdrCommandRunning {
                 : ["pid": a.pid, "name": "codex", "argv": argv, "cwd": home]
             return try json(["result": ["process_info": ["shell_pid": 10, "foreground_process_group_id": a.shell ? 10 : a.pid, "foreground_processes": [process]]]])
         }
+        if args[0...1] == ["pane", "read"] { return shellPrompt }
         if args[0...1] == ["agent", "read"] {
             // Also exercise the API result envelope accepted by the coordinator.
             return try json(["result": ["text": composer]])
@@ -228,7 +249,7 @@ private actor FakeHerdr: HerdrCommandRunning {
         if args[0...1] == ["agent", "send-keys"] {
             #expect(args[3] == "esc")
             operations.append("esc:\(args[2])")
-            composer = "› Ask Codex to do anything\nGPT-6-Sol low"
+            composer = "› Ask Codex to do anything\nGPT-6-Sol low · ~/repo"
             return "{}"
         }
         if args[0...1] == ["agent", "prompt"] {

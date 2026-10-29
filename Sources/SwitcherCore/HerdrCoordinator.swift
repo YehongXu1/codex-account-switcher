@@ -182,8 +182,13 @@ public actor HerdrCoordinator: HerdrSessionCoordinating {
             let current = try await validateOriginal(record)
             if current.needsSelectionClear {
                 _ = try await command(["agent", "send-keys", record.paneID, "esc"])
-                let cleared = try await validateOriginal(record)
-                guard !cleared.needsSelectionClear else { throw failure("\(record.paneID) 未能退出文本选择模式，已停止切换。") }
+                var selectionCleared = false
+                for _ in 0..<min(pollAttempts, 8) {
+                    let cleared = try await validateOriginal(record)
+                    if !cleared.needsSelectionClear { selectionCleared = true; break }
+                    try await Task.sleep(for: pollDelay)
+                }
+                guard selectionCleared else { throw failure("\(record.paneID) 未能退出文本选择模式，已停止切换。") }
             }
             journal?.records[index].state = .quitting
             try persist()
@@ -255,6 +260,7 @@ public actor HerdrCoordinator: HerdrSessionCoordinating {
                 throw failure("\(record.paneID) 的退出结果尚未确认；请在该窗口正常退出 Codex 后重试恢复。")
             }
             guard current.isReady else { throw failure("\(record.paneID) 已恢复原对话，但仍需在窗口中完成登录或处理提示。") }
+            try await verifyFreshProcess(process, record: record)
             journal?.records[index].state = .resumed
             try persist()
             return
@@ -264,6 +270,10 @@ public actor HerdrCoordinator: HerdrSessionCoordinating {
         }
         guard record.state != .resuming else {
             throw failure("\(record.paneID) 已发送过恢复命令但未确认成功；请在该窗口运行 codex --no-daemon resume \(record.threadID)，然后重试恢复。")
+        }
+        let shellText = Self.readText(try await command(["pane", "read", record.paneID, "--source", "visible", "--lines", "20"]))
+        guard Self.hasEmptyShellPrompt(shellText), info.foregroundProcesses.first?.cwd == record.cwd else {
+            throw failure("\(record.paneID) 的 shell 有未发送输入或提示符/目录无法确认，请回到原目录的空提示符后重试恢复。")
         }
         journal?.records[index].state = .resuming
         try persist()
@@ -277,6 +287,7 @@ public actor HerdrCoordinator: HerdrSessionCoordinating {
             if pane.agent == "codex", pane.agentSession?.value == record.threadID,
                let running = process.foregroundProcesses.first(where: { $0.isCodex }),
                running.pid != record.pid, pane.isReady {
+                try await verifyFreshProcess(running, record: record)
                 journal?.records[index].state = .resumed
                 try persist()
                 return
@@ -287,6 +298,26 @@ public actor HerdrCoordinator: HerdrSessionCoordinating {
             try await Task.sleep(for: pollDelay)
         }
         throw failure("\(record.paneID) 的恢复尚未确认；原对话记录仍在，请在窗口中查看提示后重试恢复。")
+    }
+
+    private func verifyFreshProcess(_ process: ForegroundProcess, record: Record) async throws {
+        guard process.argv.contains("--no-daemon"), process.cwd == record.cwd,
+              Self.supportsArguments(Array(process.argv.dropFirst()), cwd: record.cwd, threadID: record.threadID) else {
+            throw failure("\(record.paneID) 的恢复进程未使用预期的独立运行方式或目录，请检查窗口。")
+        }
+        let environment = try await runner.run(URL(fileURLWithPath: "/bin/ps"), ["eww", "-p", String(process.pid), "-o", "command="])
+        let home = Self.codexHome(from: environment, defaultHome: FileManager.default.homeDirectoryForCurrentUser.appendingPathComponent(".codex").path)
+        guard URL(fileURLWithPath: home).standardizedFileURL.resolvingSymlinksInPath()
+            == URL(fileURLWithPath: record.codexHome).standardizedFileURL.resolvingSymlinksInPath() else {
+            throw failure("\(record.paneID) 恢复后使用了不同的登录目录，请检查窗口。")
+        }
+    }
+
+    static func hasEmptyShellPrompt(_ output: String) -> Bool {
+        guard let line = output.components(separatedBy: .newlines).last(where: { !$0.trimmingCharacters(in: .whitespaces).isEmpty }) else { return false }
+        // The user's normal zsh prompt. Unknown/custom prompts need manual recovery.
+        let text = line.trimmingCharacters(in: .whitespaces)
+        return text.range(of: #"^(?:\([^()\r\n]+\) )?[A-Za-z0-9._-]+@[A-Za-z0-9._-]+ [^%$\r\n]+ [%$]$"#, options: .regularExpression) != nil
     }
 
     static func resumeCommand(executable: String, home: String, cwd: String, threadID: String) -> String {
@@ -381,28 +412,30 @@ public actor HerdrCoordinator: HerdrSessionCoordinating {
     }
 
     private static func isKnownSelection(_ output: String) -> Bool {
-        output.contains("copy & follow") && output.contains("esc clear")
+        guard let last = output.components(separatedBy: .newlines).last(where: { !$0.trimmingCharacters(in: .whitespaces).isEmpty }) else { return false }
+        return last.contains("copy & follow") && last.contains("esc clear")
     }
 
     /// Conservative guard: never clear or submit user drafts to make a switch work.
     static func hasEmptyComposer(_ output: String, allowSelection: Bool = false) -> Bool {
-        let selection = isKnownSelection(output)
-        if output.contains("copy & follow") || output.contains("esc clear") || output.contains("复制并跟随") {
-            guard allowSelection && selection else { return false }
+        let lines = output.components(separatedBy: .newlines).map { $0.trimmingCharacters(in: .whitespaces) }
+        var nonempty = lines.indices.filter { !lines[$0].isEmpty }
+        guard let last = nonempty.last else { return false }
+        if lines[last].contains("copy & follow") || lines[last].contains("esc clear") {
+            guard allowSelection && isKnownSelection(output) else { return false }
+            nonempty.removeLast()
         }
-        let lines = output.components(separatedBy: .newlines)
-        guard let index = lines.lastIndex(where: { $0.trimmingCharacters(in: .whitespaces).hasPrefix("›") }) else { return false }
-        let prompt = lines[index].trimmingCharacters(in: .whitespaces).dropFirst().trimmingCharacters(in: .whitespaces)
+        if let last = nonempty.last, lines[last] == "? for shortcuts"
+            || lines[last].range(of: #"^\d+% context left(?: · .*)?$"#, options: .regularExpression) != nil {
+            nonempty.removeLast()
+        }
+        // The footer is one line at the bottom, not an arbitrary draft line starting with GPT.
+        guard let footer = nonempty.last,
+              lines[footer].range(of: #"^(?:GPT|gpt)-[A-Za-z0-9.-]+ (?:minimal|low|medium|high|xhigh|max|ultra) · .+$"#, options: .regularExpression) != nil,
+              let promptIndex = lines[..<footer].lastIndex(where: { $0.hasPrefix("›") }) else { return false }
+        let prompt = lines[promptIndex].dropFirst().trimmingCharacters(in: .whitespaces)
         guard prompt.isEmpty || prompt == "Ask Codex to do anything" else { return false }
-        // A multiline draft must not be mistaken for an empty first input line.
-        for line in lines.dropFirst(index + 1) {
-            let text = line.trimmingCharacters(in: .whitespaces)
-            if text.isEmpty { continue }
-            if allowSelection && selection && text.contains("copy & follow") && text.contains("esc clear") { continue }
-            if text.hasPrefix("GPT-") || text.hasPrefix("gpt-") || text.contains("context left") || text.contains("? for shortcuts") { continue }
-            return false
-        }
-        return true
+        return lines[(promptIndex + 1)..<footer].allSatisfy { $0.isEmpty }
     }
 
     static func codexHome(from environment: String, defaultHome: String) -> String {
@@ -442,9 +475,21 @@ public actor HerdrCoordinator: HerdrSessionCoordinating {
         guard journal == nil, FileManager.default.fileExists(atPath: journalURL.path) else { return }
         let attributes = try FileManager.default.attributesOfItem(atPath: journalURL.path)
         guard attributes[.type] as? FileAttributeType == .typeRegular else { throw failure("Herdr 恢复文件不是普通文件，请检查安装目录。") }
-        do { journal = try JSONDecoder().decode(Journal.self, from: Data(contentsOf: journalURL)) }
+        let loaded: Journal
+        do { loaded = try JSONDecoder().decode(Journal.self, from: Data(contentsOf: journalURL)) }
         catch { throw failure("Herdr 恢复记录无法读取；请保留文件并检查原窗口。") }
-        guard journal?.version == 1, journal?.sessionName == sessionName else { throw failure("Herdr 恢复记录版本或会话不匹配。") }
+        guard loaded.version == 1, loaded.sessionName == sessionName else { throw failure("Herdr 恢复记录版本或会话不匹配。") }
+        for record in loaded.records {
+            guard UUID(uuidString: record.threadID) != nil, record.pid > 0,
+                  record.paneID.range(of: #"^[A-Za-z0-9]+:p[0-9]+$"#, options: .regularExpression) != nil,
+                  !record.terminalID.isEmpty, record.cwd.hasPrefix("/"), record.executable.hasPrefix("/"),
+                  URL(fileURLWithPath: record.executable).lastPathComponent == "codex",
+                  URL(fileURLWithPath: record.codexHome).standardizedFileURL.resolvingSymlinksInPath()
+                    == activeHome.standardizedFileURL.resolvingSymlinksInPath() else {
+                throw failure("Herdr 恢复记录中的窗口、对话或启动路径无效。")
+            }
+        }
+        journal = loaded
     }
     private func persist() throws {
         guard let journal else { return }
