@@ -1,13 +1,27 @@
 import Foundation
 import SwitcherCore
 import Darwin
+import AppKit
 
 /// One production operation per invocation. An external orchestrator owns the
 /// alternate-account / original-account round trip and its unconditional return.
 /// This program prints only sanitized metadata; it never prints credentials or RPC diagnostics.
 @main
 struct HerdrRoundtripCheck {
-    @MainActor static func main() async {
+    @MainActor static func main() {
+        // NSWorkspace lifecycle observations require a real AppKit run loop.
+        // An async command-line main only drains the dispatch queue, which can
+        // leave runningApplications stale after a successful Desktop quit.
+        let application = NSApplication.shared
+        application.setActivationPolicy(.prohibited)
+        Task { @MainActor in
+            await execute()
+            exit(0)
+        }
+        application.run()
+    }
+
+    @MainActor private static func execute() async {
         let args = Array(CommandLine.arguments.dropFirst())
         guard let mode = args.first, ["switch", "usage", "inspect", "recover"].contains(mode),
               args.count == ((mode == "switch" || mode == "usage") ? 3 : 2),
