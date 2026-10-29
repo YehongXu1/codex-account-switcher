@@ -247,7 +247,7 @@ public actor HerdrCoordinator: HerdrSessionCoordinating {
         try sameTerminal(current, record)
         let info = try await processInfo(record.paneID)
         if let process = info.foregroundProcesses.first(where: { $0.isCodex }) {
-            guard current.agentSession?.value == record.threadID else {
+            guard try await threadID(pane: current, process: process) == record.threadID else {
                 throw failure("\(record.paneID) 正在运行另一条对话，未自动输入任何内容。")
             }
             if process.pid == record.pid {
@@ -272,8 +272,8 @@ public actor HerdrCoordinator: HerdrSessionCoordinating {
             throw failure("\(record.paneID) 已发送过恢复命令但未确认成功；请在该窗口运行 codex --no-daemon resume \(record.threadID)，然后重试恢复。")
         }
         let shellText = Self.readText(try await command(["pane", "read", record.paneID, "--source", "visible", "--lines", "20"]))
-        guard Self.hasEmptyShellPrompt(shellText), info.foregroundProcesses.first?.cwd == record.cwd else {
-            throw failure("\(record.paneID) 的 shell 有未发送输入或提示符/目录无法确认，请回到原目录的空提示符后重试恢复。")
+        guard Self.hasEmptyShellPrompt(shellText) else {
+            throw failure("\(record.paneID) 的 shell 有未发送输入或提示符无法确认，请回到空提示符后重试恢复。")
         }
         journal?.records[index].state = .resuming
         try persist()
@@ -284,20 +284,64 @@ public actor HerdrCoordinator: HerdrSessionCoordinating {
             let pane = try await pane(record.paneID)
             try sameTerminal(pane, record)
             let process = try await processInfo(record.paneID)
-            if pane.agent == "codex", pane.agentSession?.value == record.threadID,
-               let running = process.foregroundProcesses.first(where: { $0.isCodex }),
-               running.pid != record.pid, pane.isReady {
+            if pane.agent == "codex", let running = process.foregroundProcesses.first(where: { $0.isCodex }),
+               running.pid != record.pid, pane.isReady,
+               let actual = try await threadID(pane: pane, process: running) {
+                guard actual == record.threadID else {
+                    throw failure("\(record.paneID) 的对话 ID 与原记录不一致，请在窗口中检查。")
+                }
                 try await verifyFreshProcess(running, record: record)
                 journal?.records[index].state = .resumed
                 try persist()
                 return
             }
-            if pane.agent == "codex", let actual = pane.agentSession?.value, actual != record.threadID {
-                throw failure("\(record.paneID) 的对话 ID 与原记录不一致，请在窗口中检查。")
-            }
             try await Task.sleep(for: pollDelay)
         }
         throw failure("\(record.paneID) 的恢复尚未确认；原对话记录仍在，请在窗口中查看提示后重试恢复。")
+    }
+
+    /// Herdr's SessionStart hook can be absent after resume. An open rollout file
+    /// identifies the loaded conversation even if `/resume` changed it since launch.
+    /// Only descriptor paths are read; transcript contents are never inspected.
+    private func threadID(pane: Pane, process: ForegroundProcess) async throws -> String? {
+        let reported: String?
+        if let session = pane.agentSession {
+            guard session.agent == "codex", session.kind == "id", let id = UUID(uuidString: session.value) else {
+                throw failure("\(pane.paneID) 的 Herdr 对话标识无效，已停止自动处理。")
+            }
+            reported = id.uuidString.lowercased()
+        } else { reported = nil }
+        let files = try await runner.run(URL(fileURLWithPath: "/usr/sbin/lsof"), ["-nP", "-a", "-p", String(process.pid), "-Fn"])
+        let runtimeIDs = Self.runtimeThreadIDs(from: files, home: activeHome)
+        guard runtimeIDs.count <= 1 else {
+            throw failure("\(pane.paneID) 同时打开了多条对话记录，无法确认应恢复哪一条。")
+        }
+        if let runtime = runtimeIDs.first {
+            if let reported, reported != runtime {
+                throw failure("\(pane.paneID) 的运行中对话与 Herdr 标识不一致，已停止自动处理。")
+            }
+            return runtime
+        }
+        return reported
+    }
+
+    static func runtimeThreadIDs(from output: String, home: URL) -> Set<String> {
+        let root = home.standardizedFileURL.resolvingSymlinksInPath()
+        let directories = ["sessions", "archived_sessions"].map {
+            root.appendingPathComponent($0).path + "/"
+        }
+        let pattern = #"^rollout-.+-([0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12})\.jsonl$"#
+        guard let expression = try? NSRegularExpression(pattern: pattern) else { return [] }
+        var result = Set<String>()
+        for field in output.components(separatedBy: .newlines) where field.hasPrefix("n/") {
+            let path = URL(fileURLWithPath: String(field.dropFirst())).standardizedFileURL.resolvingSymlinksInPath()
+            guard directories.contains(where: { path.path.hasPrefix($0) }) else { continue }
+            let name = path.lastPathComponent
+            guard let match = expression.firstMatch(in: name, range: NSRange(name.startIndex..., in: name)),
+                  let range = Range(match.range(at: 1), in: name), let id = UUID(uuidString: String(name[range])) else { continue }
+            result.insert(id.uuidString.lowercased())
+        }
+        return result
     }
 
     private func verifyFreshProcess(_ process: ForegroundProcess, record: Record) async throws {
@@ -329,10 +373,6 @@ public actor HerdrCoordinator: HerdrSessionCoordinating {
         guard pane.agent == "codex", pane.isReady else {
             throw failure("\(pane.paneID) 的 Codex 正在工作、等待审批或状态不明确，请先让它回到空闲输入界面。")
         }
-        guard let session = pane.agentSession, session.agent == "codex", session.kind == "id",
-              UUID(uuidString: session.value) != nil else {
-            throw failure("\(pane.paneID) 没有可确认的原对话 ID，已停止切换。")
-        }
         guard info.foregroundProcesses.count == 1, let process = info.foregroundProcesses.first,
               process.isCodex, process.pid > 0, process.pid != info.shellPID,
               let executable = process.argv.first, executable.hasPrefix("/"),
@@ -340,11 +380,14 @@ public actor HerdrCoordinator: HerdrSessionCoordinating {
               let cwd = process.cwd ?? pane.foregroundCWD ?? pane.cwd, cwd.hasPrefix("/") else {
             throw failure("\(pane.paneID) 的 Codex 启动方式无法安全恢复，已停止切换。")
         }
+        guard let sessionID = try await threadID(pane: pane, process: process) else {
+            throw failure("\(pane.paneID) 没有可确认的原对话 ID，已停止切换。")
+        }
         // Custom profiles/config arguments could select different auth stores. Do not silently drop them.
         guard !process.argv.contains(where: { $0 == "-p" || $0 == "--profile" || $0.hasPrefix("--profile=") || $0 == "-c" || $0 == "--config" || $0.hasPrefix("--config=") }) else {
             throw failure("\(pane.paneID) 使用了自定义 profile/config，请手动退出并恢复该窗口。")
         }
-        guard Self.supportsArguments(Array(process.argv.dropFirst()), cwd: cwd, threadID: session.value) else {
+        guard Self.supportsArguments(Array(process.argv.dropFirst()), cwd: cwd, threadID: sessionID) else {
             throw failure("\(pane.paneID) 使用了额外启动参数，请手动退出并恢复该窗口，以保留这些设置。")
         }
         let environment = try await runner.run(URL(fileURLWithPath: "/bin/ps"), ["eww", "-p", String(process.pid), "-o", "command="])
@@ -357,7 +400,7 @@ public actor HerdrCoordinator: HerdrSessionCoordinating {
         guard Self.hasEmptyComposer(text, allowSelection: true) else {
             throw failure("\(pane.paneID) 有未发送输入、文本选择或无法识别的界面，请清空输入并按 Esc 返回普通输入界面。")
         }
-        return Record(paneID: pane.paneID, terminalID: pane.terminalID, threadID: session.value,
+        return Record(paneID: pane.paneID, terminalID: pane.terminalID, threadID: sessionID,
                       cwd: cwd, executable: executable, codexHome: home, pid: process.pid, needsSelectionClear: Self.isKnownSelection(text), state: .prepared)
     }
 

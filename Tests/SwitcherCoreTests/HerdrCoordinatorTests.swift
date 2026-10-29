@@ -121,6 +121,61 @@ struct HerdrCoordinatorTests {
         try await fixture.coordinator.resume()
     }
 
+    @Test func absentHerdrSessionUsesOpenRolloutAndSupportsRepeatedSwitch() async throws {
+        let fixture = try Fixture()
+        defer { fixture.clean() }
+        await fixture.runner.hideSessionMetadata()
+        try await fixture.coordinator.prepare()
+        try await fixture.coordinator.suspend()
+        try await fixture.coordinator.resume()
+        #expect(await fixture.runner.starts().count == 1)
+        try await fixture.coordinator.prepare()
+        try await fixture.coordinator.resume()
+        #expect(await fixture.runner.starts().count == 1)
+    }
+
+    @Test func lostResumeResponseWithNoHookUsesRuntimeFileWithoutDuplicateStart() async throws {
+        let fixture = try Fixture()
+        defer { fixture.clean() }
+        try await fixture.coordinator.prepare()
+        try await fixture.coordinator.suspend()
+        await fixture.runner.hideSessionMetadata()
+        await fixture.runner.loseNextResumeResponse()
+        await #expect(throws: (any Error).self) { try await fixture.coordinator.resume() }
+        try await fixture.makeCoordinator().resume()
+        #expect(await fixture.runner.starts().count == 1)
+    }
+
+    @Test func mismatchedOrAmbiguousRuntimeThreadsBlockBeforeQuit() async throws {
+        let fixture = try Fixture()
+        defer { fixture.clean() }
+        await fixture.runner.setRuntimeThreads([UUID().uuidString])
+        await #expect(throws: (any Error).self) { try await fixture.coordinator.prepare() }
+        #expect(await fixture.runner.mutations().isEmpty)
+        await fixture.runner.setRuntimeThreads([fixture.ids[0], UUID().uuidString])
+        await #expect(throws: (any Error).self) { try await fixture.coordinator.prepare() }
+        #expect(await fixture.runner.mutations().isEmpty)
+        await fixture.runner.hideSessionMetadata()
+        await fixture.runner.setRuntimeThreads([])
+        await #expect(throws: (any Error).self) { try await fixture.coordinator.prepare() }
+        #expect(await fixture.runner.mutations().isEmpty)
+    }
+
+    @Test func runtimePathsAreScopedAndDuplicatesDoNotCreateAmbiguity() {
+        let id = UUID().uuidString.lowercased()
+        let other = UUID().uuidString.lowercased()
+        let home = URL(fileURLWithPath: "/test/codex")
+        let output = """
+        p123
+        n/test/codex/sessions/2026/10/29/rollout-2026-10-29T12-00-00-\(id).jsonl
+        n/test/codex/sessions/2026/10/29/rollout-2026-10-29T12-00-00-\(id).jsonl
+        n/test/codex-other/sessions/rollout-2026-10-29T12-00-00-\(other).jsonl
+        n/test/codex/logs/rollout-2026-10-29T12-00-00-\(other).jsonl
+        n/test/codex/sessions/not-a-rollout-\(other).jsonl
+        """
+        #expect(HerdrCoordinator.runtimeThreadIDs(from: output, home: home) == [id])
+    }
+
     @Test func shellDraftPreventsAutomaticResumeInput() async throws {
         let fixture = try Fixture()
         defer { fixture.clean() }
@@ -198,6 +253,8 @@ private actor FakeHerdr: HerdrCommandRunning {
     private var lateAgent = false
     private var extraArguments: [String] = []
     private var shellPrompt = "fixture@host repo %"
+    private var metadataHidden = false
+    private var runtimeThreads: [String]?
     private var composer = "› Ask Codex to do anything\nGPT-6-Sol low · ~/repo"
     init(home: String, ids: [String]) {
         self.home = home
@@ -212,6 +269,8 @@ private actor FakeHerdr: HerdrCommandRunning {
     func addAgentAfterQuit() { lateAgent = true }
     func setExtraArguments(_ values: [String]) { extraArguments = values }
     func setShellPrompt(_ value: String) { shellPrompt = value }
+    func hideSessionMetadata() { metadataHidden = true }
+    func setRuntimeThreads(_ values: [String]) { runtimeThreads = values }
     func startDifferentThread(_ pane: String) {
         let index = agents.firstIndex { $0.pane == pane }!
         agents[index].shell = false; agents[index].pid += 500; agents[index].thread = UUID().uuidString
@@ -222,6 +281,13 @@ private actor FakeHerdr: HerdrCommandRunning {
 
     func run(_ executable: URL, _ arguments: [String]) async throws -> String {
         if executable.path == "/bin/ps" { return "codex HOME=/test CODEX_HOME=\(home) USER=test" }
+        if executable.path == "/usr/sbin/lsof" {
+            let pid = Int(arguments[3])!
+            let agent = agents.first { $0.pid == pid }!
+            return (runtimeThreads ?? [agent.thread]).map {
+                "n\(home)/sessions/2026/10/29/rollout-2026-10-29T12-00-00-\($0).jsonl"
+            }.joined(separator: "\n")
+        }
         #expect(Array(arguments.prefix(2)) == ["--session", "yehong"])
         let args = Array(arguments.dropFirst(2))
         if args == ["api", "snapshot"] {
@@ -278,7 +344,7 @@ private actor FakeHerdr: HerdrCommandRunning {
         var result: [String: Any] = ["pane_id": a.pane, "terminal_id": a.terminal, "cwd": home, "foreground_cwd": home]
         if !a.shell {
             result["agent"] = "codex"; result["agent_status"] = a.status
-            result["agent_session"] = ["agent": "codex", "kind": "id", "value": a.thread]
+            if !metadataHidden { result["agent_session"] = ["agent": "codex", "kind": "id", "value": a.thread] }
         }
         return result
     }
