@@ -42,7 +42,8 @@ change is rejected before closing Desktop and is checked again before saving cre
 failures and keeps its AppKit run loop alive while pending late-exit recovery finishes,
 with a bounded wait and a separate `desktopRecovery` result. The menu-bar app observes
 accepted quit requests for up to 120 seconds and refuses another switch while recovery
-is pending. Do not replace the Homebrew `herdr` executable, issue kill signals, or
+is pending. A 15-second watchdog releases a stalled recovery reopen; late callbacks
+cannot alter a later attempt. Do not replace the Homebrew `herdr` executable, issue kill signals, or
 ignore failed preflight commands to make a live check pass. A passing simulated test
 suite does not certify a real cross-account handoff; that remains a separate user-directed
 operation after installation.

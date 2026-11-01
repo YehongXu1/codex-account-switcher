@@ -85,6 +85,58 @@ struct DesktopControllerTests {
         #expect(recovery.action(runningPIDs: []) == .reopen)
     }
 
+    @Test func reopenTimeoutReleasesRecoveryAndIgnoresLateCompletion() {
+        var recovery = DesktopRecoveryState()
+        let generation = recovery.beginWaiting()
+        #expect(recovery.transition(generation: generation, from: .waitingForExit, to: .reopening))
+        #expect(recovery.status.isPending)
+        #expect(recovery.transition(generation: generation, from: .reopening, to: .reopenTimedOut))
+        #expect(!recovery.status.isPending)
+
+        for completion in [DesktopRecoveryStatus.reopened, .reopenFailed] {
+            #expect(!recovery.transition(generation: generation, from: .reopening, to: completion))
+            #expect(recovery.status == .reopenTimedOut)
+        }
+    }
+
+    @Test func oldCallbacksCannotOverwriteRetryEvenWhenBothAttemptsAreReopening() {
+        var recovery = DesktopRecoveryState()
+        let oldGeneration = recovery.beginWaiting()
+        recovery.transition(generation: oldGeneration, from: .waitingForExit, to: .reopening)
+        recovery.transition(generation: oldGeneration, from: .reopening, to: .reopenTimedOut)
+
+        let retryGeneration = recovery.beginWaiting()
+        #expect(!recovery.isWaiting(generation: oldGeneration))
+        #expect(recovery.isWaiting(generation: retryGeneration))
+        #expect(!recovery.transition(generation: oldGeneration, from: .waitingForExit,
+                                    to: .desktopStillRunning))
+        #expect(recovery.transition(generation: retryGeneration, from: .waitingForExit, to: .reopening))
+        for staleResult in [DesktopRecoveryStatus.reopened, .reopenFailed, .reopenTimedOut] {
+            #expect(!recovery.transition(generation: oldGeneration, from: .reopening, to: staleResult))
+            #expect(recovery.status == .reopening)
+        }
+        #expect(recovery.transition(generation: retryGeneration, from: .reopening, to: .reopened))
+        #expect(recovery.status == .reopened)
+    }
+
+    @Test func completedReopenCannotBeChangedByItsWatchdog() {
+        var recovery = DesktopRecoveryState()
+        let generation = recovery.beginWaiting()
+        recovery.transition(generation: generation, from: .waitingForExit, to: .reopening)
+        recovery.transition(generation: generation, from: .reopening, to: .reopened)
+        #expect(!recovery.transition(generation: generation, from: .reopening, to: .reopenTimedOut))
+        #expect(recovery.status == .reopened)
+    }
+
+    @Test func newCloseOrDirectReopenInvalidatesOldRecovery() {
+        var recovery = DesktopRecoveryState()
+        let generation = recovery.beginWaiting()
+        recovery.reset()
+        #expect(!recovery.isWaiting(generation: generation))
+        #expect(!recovery.transition(generation: generation, from: .waitingForExit, to: .reopening))
+        #expect(recovery.status == .notNeeded)
+    }
+
     @Test func helperWaitsForAsynchronousReopenAfterObservationEnds() async {
         let statuses = RecoveryStatusSequence([.waitingForExit, .reopening, .reopening, .reopened])
         let result = await DesktopRecoveryWaiter(timeout: .seconds(1), pollInterval: .milliseconds(1))
@@ -106,7 +158,8 @@ struct DesktopControllerTests {
     }
 
     @Test func helperDoesNotWaitAfterRecoveryExpiresOrWasNotNeeded() async {
-        for status in [DesktopRecoveryStatus.desktopStillRunning, .notNeeded, .replacementRunning] {
+        for status in [DesktopRecoveryStatus.desktopStillRunning, .notNeeded,
+                       .replacementRunning, .reopenTimedOut] {
             let result = await DesktopRecoveryWaiter(timeout: .zero).wait { status }
             #expect(result == status)
         }

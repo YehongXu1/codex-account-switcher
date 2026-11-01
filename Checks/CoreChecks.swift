@@ -49,11 +49,13 @@ private actor FakeStore: AccountStoring {
     let recorder: Recorder
     let original: AccountProfile
     let target: AccountProfile
+    private var credential: AccountProfile
 
     init(recorder: Recorder, original: AccountProfile, target: AccountProfile) {
         self.recorder = recorder
         self.original = original
         self.target = target
+        self.credential = original
     }
 
     func loadRegistry() -> AccountRegistry {
@@ -63,29 +65,30 @@ private actor FakeStore: AccountStoring {
     func activeCodexHome() -> URL { URL(fileURLWithPath: "/tmp/active") }
     func activeCredentialExists() -> Bool { true }
     func saveCurrentCredential() async { await recorder.append(.saveCurrentCredential) }
-    func activateTargetCredential(id: UUID) async { await recorder.append(.activateTargetCredential) }
-    func restoreActiveCredential(id: UUID) {}
+    func activateTargetCredential(id: UUID) async {
+        await recorder.append(.activateTargetCredential)
+        credential = target
+    }
+    func restoreActiveCredential(id: UUID) { credential = original }
+    func credentialProfile() -> AccountProfile { credential }
     func commitActiveAccountID(_ id: UUID) async { await recorder.append(.commitActiveAccountID) }
 }
 
 private actor FakeCodex: CodexIdentityReading {
     let recorder: Recorder
-    let original: AccountProfile
+    let store: FakeStore
     let target: AccountProfile
-    private var hasVerifiedOriginal = false
-    init(recorder: Recorder, original: AccountProfile, target: AccountProfile) {
+    init(recorder: Recorder, store: FakeStore, target: AccountProfile) {
         self.recorder = recorder
-        self.original = original
+        self.store = store
         self.target = target
     }
 
     func readIdentity(profileHome: URL) async throws -> AccountIdentity {
-        if !hasVerifiedOriginal {
-            hasVerifiedOriginal = true
-            return AccountIdentity(accountID: original.accountID, email: original.email)
-        }
-        await recorder.append(.verifyTargetIdentity)
-        return AccountIdentity(accountID: target.accountID, email: target.email)
+        // Identity follows credential activation, not the number of preflight reads.
+        let profile = await store.credentialProfile()
+        if profile.id == target.id { await recorder.append(.verifyTargetIdentity) }
+        return AccountIdentity(accountID: profile.accountID, email: profile.email)
     }
 }
 
@@ -365,10 +368,11 @@ struct CoreChecks {
         try secondBytes.write(to: activeCredential)
 
         let recorder = Recorder()
+        let switchStore = FakeStore(recorder: recorder, original: first, target: second)
         let switcher = SwitchService(
             desktop: FakeDesktop(recorder: recorder),
-            store: FakeStore(recorder: recorder, original: first, target: second),
-            codex: FakeCodex(recorder: recorder, original: first, target: second)
+            store: switchStore,
+            codex: FakeCodex(recorder: recorder, store: switchStore, target: second)
         )
         try await switcher.switchAccount(to: second.id)
         let recordedStages = await recorder.snapshot()

@@ -78,15 +78,46 @@ struct DesktopQuitRecovery: Sendable {
 
 enum DesktopRecoveryStatus: String, Sendable {
     case notNeeded, waitingForExit, reopening, reopened, desktopStillRunning
-    case replacementRunning, reopenFailed, waitTimedOut, waitCancelled
+    case replacementRunning, reopenFailed, reopenTimedOut, waitTimedOut, waitCancelled
 
     var isPending: Bool { self == .waitingForExit || self == .reopening }
+}
+
+/// Every callback must belong to the current attempt and its expected phase.
+/// A late NSWorkspace completion must not revive an expired recovery or modify
+/// a new switch that started after the reopen watchdog released the old one.
+struct DesktopRecoveryState: Sendable {
+    private(set) var generation = UUID()
+    private(set) var status = DesktopRecoveryStatus.notNeeded
+
+    mutating func reset() {
+        generation = UUID()
+        status = .notNeeded
+    }
+
+    mutating func beginWaiting() -> UUID {
+        reset()
+        status = .waitingForExit
+        return generation
+    }
+
+    func isWaiting(generation: UUID) -> Bool {
+        self.generation == generation && status == .waitingForExit
+    }
+
+    @discardableResult
+    mutating func transition(generation: UUID, from: DesktopRecoveryStatus,
+                             to: DesktopRecoveryStatus) -> Bool {
+        guard self.generation == generation, status == from else { return false }
+        status = to
+        return true
+    }
 }
 
 /// A command-line helper must keep its AppKit run loop alive until both the
 /// observation and any asynchronous reopen finish. The menu-bar app need not wait.
 struct DesktopRecoveryWaiter: Sendable {
-    var timeout: Duration = .seconds(135)
+    var timeout: Duration = .seconds(140)
     var pollInterval: Duration = .milliseconds(100)
 
     func wait(status: @Sendable () async -> DesktopRecoveryStatus) async -> DesktopRecoveryStatus {
@@ -128,14 +159,15 @@ final class DesktopController: DesktopControlling {
     private var recovery = DesktopQuitRecovery()
     private var terminationObserver: NSObjectProtocol?
     private var recoveryExpiry: Task<Void, Never>?
-    private var recoveryStatus = DesktopRecoveryStatus.notNeeded
+    private var reopenExpiry: Task<Void, Never>?
+    private var recoveryState = DesktopRecoveryState()
 
     func validateCloseRequest() async throws {
         try validateCloseRequest(for: runningDesktopApplications)
     }
 
     private func validateCloseRequest(for applications: [NSRunningApplication]) throws {
-        guard !recoveryStatus.isPending else { throw DesktopControllerError.recoveryInProgress }
+        guard !recoveryState.status.isPending else { throw DesktopControllerError.recoveryInProgress }
         try DesktopCloseSafety.validate(currentPID: getpid(),
             desktopPIDs: Set(applications.map(\.processIdentifier)),
             parentOf: DesktopCloseSafety.parentProcessID)
@@ -147,8 +179,9 @@ final class DesktopController: DesktopControlling {
         // separate validation method lets SwitchService fail before Herdr prep.
         try validateCloseRequest(for: running)
         stopRecoveryObservation()
+        stopReopenWatchdog()
         recovery = DesktopQuitRecovery()
-        recoveryStatus = .notNeeded
+        recoveryState.reset()
         guard !running.isEmpty else { return }
         for application in running where !application.isTerminated {
             let processIdentifier = application.processIdentifier
@@ -168,14 +201,15 @@ final class DesktopController: DesktopControlling {
         // Register before taking the snapshot so an exit between them cannot be
         // missed. A timeout is not proof that Desktop will remain open.
         stopRecoveryObservation()
-        recoveryStatus = .waitingForExit
+        stopReopenWatchdog()
+        let generation = recoveryState.beginWaiting()
         terminationObserver = NSWorkspace.shared.notificationCenter.addObserver(
             forName: NSWorkspace.didTerminateApplicationNotification, object: nil, queue: .main
         ) { [self] _ in
             // Retain the recovery owner until the bounded expiry removes this
             // observer, even if the short-lived operation releases its service.
             Task { @MainActor in
-                do { try await self.recoverIfDesktopExited() }
+                do { try await self.recoverIfDesktopExited(generation: generation) }
                 catch { NSLog("Codex Account Switcher: late Desktop reopen failed; open Desktop manually.") }
             }
         }
@@ -183,43 +217,60 @@ final class DesktopController: DesktopControlling {
         recoveryExpiry = Task { @MainActor [weak self] in
             do { try await Task.sleep(for: .seconds(120)) }
             catch { return }
-            guard !Task.isCancelled, let self, self.recoveryStatus == .waitingForExit else { return }
+            guard !Task.isCancelled, let self,
+                  self.recoveryState.transition(generation: generation, from: .waitingForExit,
+                                                to: .desktopStillRunning) else { return }
             self.stopRecoveryObservation()
             self.recovery = DesktopQuitRecovery()
-            self.recoveryStatus = .desktopStillRunning
         }
         // Do not await a possibly slow NSWorkspace open here. A CLI caller must
         // reach its bounded drain even when Desktop has already exited.
         Task { @MainActor in
-            do { try await self.recoverIfDesktopExited() }
+            do { try await self.recoverIfDesktopExited(generation: generation) }
             catch { NSLog("Codex Account Switcher: Desktop reopen failed; open Desktop manually.") }
         }
     }
 
     func waitForCloseFailureRecovery() async -> DesktopRecoveryStatus {
-        await DesktopRecoveryWaiter().wait { await self.recoveryStatus }
+        await DesktopRecoveryWaiter().wait { await self.recoveryState.status }
     }
 
-    private func recoverIfDesktopExited() async throws {
-        guard recoveryStatus == .waitingForExit else { return }
+    private func recoverIfDesktopExited(generation: UUID) async throws {
+        guard recoveryState.isWaiting(generation: generation) else { return }
         let runningPIDs = Set(runningDesktopApplications.map(\.processIdentifier))
         switch recovery.action(runningPIDs: runningPIDs) {
         case .wait: return
         case .none:
+            recoveryState.transition(generation: generation, from: .waitingForExit,
+                                     to: .replacementRunning)
             stopRecoveryObservation()
             recovery = DesktopQuitRecovery()
-            recoveryStatus = .replacementRunning
         case .reopen:
             // Clear before awaiting to ensure simultaneous notifications cannot
             // submit duplicate opens. The error remains visible to the caller.
             stopRecoveryObservation()
             recovery = DesktopQuitRecovery()
-            recoveryStatus = .reopening
+            recoveryState.transition(generation: generation, from: .waitingForExit, to: .reopening)
+            // NSWorkspace can leave its asynchronous completion pending. Release
+            // this attempt after 15 seconds so manual recovery or a retry works.
+            reopenExpiry = Task { @MainActor [weak self] in
+                do { try await Task.sleep(for: .seconds(15)) }
+                catch { return }
+                guard !Task.isCancelled, let self,
+                      self.recoveryState.transition(generation: generation, from: .reopening,
+                                                    to: .reopenTimedOut) else { return }
+                self.reopenExpiry = nil
+                NSLog("Codex Account Switcher: Desktop reopen timed out; open Desktop manually.")
+            }
             do {
                 try await openDesktop()
-                recoveryStatus = .reopened
+                guard recoveryState.transition(generation: generation, from: .reopening,
+                                               to: .reopened) else { return }
+                stopReopenWatchdog()
             } catch {
-                recoveryStatus = .reopenFailed
+                guard recoveryState.transition(generation: generation, from: .reopening,
+                                               to: .reopenFailed) else { return }
+                stopReopenWatchdog()
                 throw error
             }
         }
@@ -234,10 +285,16 @@ final class DesktopController: DesktopControlling {
         recoveryExpiry = nil
     }
 
+    private func stopReopenWatchdog() {
+        reopenExpiry?.cancel()
+        reopenExpiry = nil
+    }
+
     func reopenDesktop() async throws {
         stopRecoveryObservation()
+        stopReopenWatchdog()
         recovery = DesktopQuitRecovery()
-        recoveryStatus = .notNeeded
+        recoveryState.reset()
         try await openDesktop()
     }
 
