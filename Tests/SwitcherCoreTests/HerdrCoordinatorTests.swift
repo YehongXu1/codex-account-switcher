@@ -35,6 +35,52 @@ struct HerdrCoordinatorTests {
         #expect(!FileManager.default.fileExists(atPath: fixture.journal.path))
     }
 
+    @Test(arguments: ["›", "»"])
+    func emptyComposerVariantsKeepExactConversation(_ glyph: String) async throws {
+        let fixture = try Fixture()
+        defer { fixture.clean() }
+        await fixture.runner.setComposer("""
+        › An earlier user message
+        A completed response
+
+        \(glyph) Ask Codex to do anything
+
+          GPT-6-Astra ultra · ~/repo · Original conversation
+          ? for shortcuts                                      ⚠ 1 warning · f2 to view
+        """)
+        try await fixture.coordinator.prepare()
+        #expect(await fixture.runner.mutations().isEmpty)
+        try await fixture.coordinator.suspend()
+        try await fixture.coordinator.resume()
+        #expect(await fixture.runner.quits() == ["w1:p1"])
+        let commands = await fixture.runner.starts()
+        #expect(commands.count == 1)
+        #expect(commands.first?.contains("resume '\(fixture.ids[0])'") == true)
+        #expect(!(await fixture.coordinator.hasPendingRecovery()))
+    }
+
+    @Test(arguments: ["›", "»"])
+    func draftAndTranscriptVariantsNeverReceiveQuit(_ glyph: String) async throws {
+        let fixture = try Fixture()
+        defer { fixture.clean() }
+        let footer = "GPT-6-Astra ultra · ~/repo"
+        let outputs = [
+            "\(glyph) unsent draft\n\(footer)\n? for shortcuts",
+            "\(glyph) Ask Codex to do anything\n  continued draft\n\(footer)\n? for shortcuts",
+            "\(glyph) \n  multiline draft\n\(footer)\n? for shortcuts              ⚠ 1 warning · f2 to view",
+            "\(glyph) Ask Codex to do anything\n\(footer)\nBrowsing transcript · ↑↓/jk scroll · ←→/hl prompts · ⌃t details · ↵ rewind · esc back",
+            "\(glyph) Ask Codex to do anything\n\(footer)\nNew activity · Earlier messages available.  enter/esc latest · ? shortcuts",
+            "\(glyph) Ask Codex to do anything\n\(footer)\nesc again to edit previous message",
+            "\(glyph) Ask Codex to do anything\n\(footer)\n? for shortcuts · unknown mode"
+        ]
+        for output in outputs {
+            await fixture.runner.setComposer(output)
+            await #expect(throws: (any Error).self) { try await fixture.coordinator.prepare() }
+            #expect(await fixture.runner.mutations().isEmpty)
+            #expect(!FileManager.default.fileExists(atPath: fixture.journal.path))
+        }
+    }
+
     @Test(arguments: ["working", "blocked", "unknown"])
     func busyOrUncertainAgentBlocksBeforeAnyQuit(_ status: String) async throws {
         let fixture = try Fixture(count: 2)
@@ -264,7 +310,9 @@ struct HerdrCoordinatorTests {
 
     @Test func composerAndEnvironmentParsingAreConservative() {
         #expect(HerdrCoordinator.hasEmptyComposer("› Ask Codex to do anything\n\nGPT-6-Sol low · ~/repo"))
+        #expect(HerdrCoordinator.hasEmptyComposer("» Ask Codex to do anything\n\nGPT-6-Sol low · ~/repo"))
         #expect(!HerdrCoordinator.hasEmptyComposer("› \n  a multiline draft\nGPT-6-Sol low · ~/repo"))
+        #expect(!HerdrCoordinator.hasEmptyComposer("» \n  a multiline draft\nGPT-6-Sol low · ~/repo"))
         #expect(!HerdrCoordinator.hasEmptyComposer("› Ask Codex to do anything\n⌃c copy · enter copy & follow · esc clear"))
         #expect(!HerdrCoordinator.hasEmptyComposer("› /quit"))
         #expect(!HerdrCoordinator.hasEmptyComposer("› \nGPT-6-Sol low · draft text\nGPT-6-Sol low · ~/repo"))

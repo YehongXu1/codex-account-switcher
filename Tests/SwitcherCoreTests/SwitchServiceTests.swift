@@ -7,10 +7,10 @@ private let desktopStages: [SwitchStage] = [.closeDesktop, .saveCurrentCredentia
     .activateTargetCredential, .verifyTargetIdentity, .commitActiveAccountID, .reopenDesktop]
 
 struct SwitchServiceTests {
-    @Test func quitFailureLeavesBothAccountsUntouched() async {
+    @Test func quitFailureRecoversDesktopAndLeavesBothAccountsUntouched() async {
         let fixture = SwitchFixture(failure: .closeDesktop)
         await expectFailure(fixture, stage: .closeDesktop)
-        #expect(await fixture.recorder.snapshot() == [.closeDesktop])
+        #expect(await fixture.recorder.snapshot() == [.closeDesktop, .reopenDesktop])
         #expect(await fixture.store.credentialOwner() == fixture.original.id)
         #expect(await fixture.store.activeAccountID() == fixture.original.id)
         #expect(await fixture.store.restoredProfileIDs().isEmpty)
@@ -41,7 +41,7 @@ struct SwitchServiceTests {
             }
             let index = desktopStages.firstIndex(of: stage)!
             var expected = Array(desktopStages[...index])
-            if stage != .closeDesktop && stage != .reopenDesktop { expected.append(.reopenDesktop) }
+            if stage != .reopenDesktop { expected.append(.reopenDesktop) }
             #expect(await fixture.recorder.snapshot() == expected)
         }
     }
@@ -129,6 +129,40 @@ struct SwitchServiceTests {
         #expect(await fixture.store.credentialOwner() == fixture.original.id)
     }
 
+    @Test func desktopHostGuardStopsBeforePreparingOrClosingAnything() async {
+        let fixture = SwitchFixture(failure: nil, withHerdr: true, desktopValidationFails: true)
+        await expectFailure(fixture, stage: .closeDesktop)
+        #expect(await fixture.recorder.snapshot().isEmpty)
+        #expect(await fixture.store.credentialOwner() == fixture.original.id)
+        #expect(await fixture.store.activeAccountID() == fixture.original.id)
+        #expect(await !fixture.service.hasPendingSessionRecovery())
+    }
+
+    @Test func quitFailureClearsPreparedSessionsAndRecoversDesktopWithoutSwitching() async {
+        let fixture = SwitchFixture(failure: .closeDesktop, withHerdr: true)
+        await expectFailure(fixture, stage: .closeDesktop)
+        #expect(await fixture.recorder.snapshot() == [.prepareHerdr, .closeDesktop, .resumeHerdr, .reopenDesktop])
+        #expect(await fixture.sessions.resumedOwners() == [fixture.original.id])
+        #expect(await fixture.store.credentialOwner() == fixture.original.id)
+        #expect(await fixture.store.activeAccountID() == fixture.original.id)
+        #expect(await !fixture.service.hasPendingSessionRecovery())
+    }
+
+    @Test func quitFailureRetainsBothQuitAndRecoveryErrors() async {
+        let fixture = SwitchFixture(failure: .closeDesktop, desktopRecoveryFails: true)
+        do {
+            try await fixture.service.switchAccount(to: fixture.target.id)
+            Issue.record("Expected quit and recovery to fail")
+        } catch let error as OperationError {
+            #expect(error.stage == .closeDesktop)
+            #expect(error.message.contains("Injected closeDesktop failure"))
+            #expect(error.message.contains("Injected reopenDesktop failure"))
+        } catch { Issue.record("Unexpected error: \(error)") }
+        #expect(await fixture.recorder.snapshot() == [.closeDesktop, .reopenDesktop])
+        #expect(await fixture.store.credentialOwner() == fixture.original.id)
+        #expect(await fixture.store.restoredProfileIDs().isEmpty)
+    }
+
     @Test func partialHerdrQuitFailureResumesOriginalAccount() async {
         let fixture = SwitchFixture(failure: .suspendHerdr, withHerdr: true)
         await expectFailure(fixture, stage: .suspendHerdr)
@@ -196,6 +230,11 @@ private actor CallRecorder {
 private struct FakeDesktop: DesktopControlling {
     let recorder: CallRecorder
     let failure: SwitchStage?
+    var validationFails = false
+    var recoveryFails = false
+    func validateCloseRequest() throws {
+        if validationFails { throw InjectedFailure(stage: .closeDesktop) }
+    }
     func closeDesktop() async throws {
         await recorder.append(.closeDesktop)
         if failure == .closeDesktop { throw InjectedFailure(stage: .closeDesktop) }
@@ -203,6 +242,10 @@ private struct FakeDesktop: DesktopControlling {
     func reopenDesktop() async throws {
         await recorder.append(.reopenDesktop)
         if failure == .reopenDesktop { throw InjectedFailure(stage: .reopenDesktop) }
+    }
+    func recoverAfterCloseFailure() async throws {
+        await recorder.append(.reopenDesktop)
+        if recoveryFails { throw InjectedFailure(stage: .reopenDesktop) }
     }
 }
 
@@ -307,7 +350,8 @@ private struct SwitchFixture {
     let service: SwitchService
     let sessions: FakeSessions
 
-    init(failure: SwitchStage?, restoreFails: Bool = false, withHerdr: Bool = false) {
+    init(failure: SwitchStage?, restoreFails: Bool = false, withHerdr: Bool = false,
+         desktopValidationFails: Bool = false, desktopRecoveryFails: Bool = false) {
         let original = AccountProfile(
             id: UUID(), displayName: "Original", email: "original@example.com",
             accountID: "original-id", createdAt: Date(), lastUsedAt: nil
@@ -331,7 +375,8 @@ private struct SwitchFixture {
         let coordinator: any HerdrSessionCoordinating
         if withHerdr { coordinator = sessions } else { coordinator = NoopHerdrCoordinator() }
         service = SwitchService(
-            desktop: FakeDesktop(recorder: recorder, failure: failure),
+            desktop: FakeDesktop(recorder: recorder, failure: failure,
+                                 validationFails: desktopValidationFails, recoveryFails: desktopRecoveryFails),
             store: store,
             codex: FakeCodex(recorder: recorder, failure: failure, store: store, target: target),
             sessions: coordinator
@@ -351,6 +396,7 @@ private actor FakeSessions: HerdrSessionCoordinating {
     func prepare() async throws {
         await recorder.append(.prepareHerdr)
         if failure == .prepareHerdr { throw InjectedFailure(stage: .prepareHerdr) }
+        pending = true
     }
     func suspend() async throws {
         pending = true

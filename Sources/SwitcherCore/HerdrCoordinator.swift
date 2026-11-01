@@ -513,14 +513,19 @@ public actor HerdrCoordinator: HerdrSessionCoordinating {
             guard allowSelection && isKnownSelection(output) else { return false }
             nonempty.removeLast()
         }
-        if let last = nonempty.last, lines[last] == "? for shortcuts"
+        // Codex can append a passive warning count to the ordinary shortcuts row.
+        // Transcript navigation and other interactive footer states stay unrecognized.
+        if let last = nonempty.last,
+            lines[last].range(of: #"^\? for shortcuts(?:\s+⚠ [1-9]\d* warnings? · f2 to view)?$"#, options: .regularExpression) != nil
             || lines[last].range(of: #"^\d+% context left(?: · .*)?$"#, options: .regularExpression) != nil {
             nonempty.removeLast()
         }
         // The footer is one line at the bottom, not an arbitrary draft line starting with GPT.
         guard let footer = nonempty.last,
               lines[footer].range(of: #"^(?:GPT|gpt)-[A-Za-z0-9.-]+ (?:minimal|low|medium|high|xhigh|max|ultra) · .+$"#, options: .regularExpression) != nil,
-              let promptIndex = lines[..<footer].lastIndex(where: { $0.hasPrefix("›") }) else { return false }
+              // Both prompt glyphs are emitted by Codex. The glyph alone does not
+              // establish an empty composer: validate its text and following rows.
+              let promptIndex = lines[..<footer].lastIndex(where: { $0.hasPrefix("›") || $0.hasPrefix("»") }) else { return false }
         let prompt = lines[promptIndex].dropFirst().trimmingCharacters(in: .whitespaces)
         guard prompt.isEmpty || prompt == "Ask Codex to do anything" else { return false }
         return lines[(promptIndex + 1)..<footer].allSatisfy { $0.isEmpty }

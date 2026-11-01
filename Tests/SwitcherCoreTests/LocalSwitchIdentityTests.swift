@@ -47,7 +47,7 @@ struct LocalSwitchIdentityTests {
         #expect(try await fixture.store.loadRegistry().activeAccountID == fixture.original.id)
         #expect(try Data(contentsOf: originalHome.appending(path: "auth.json")) == savedOriginal)
         #expect(try Data(contentsOf: fixture.active.appending(path: "auth.json")) == changedCredential)
-        #expect(await fixture.desktop.calls == ["close"])
+        #expect(await fixture.desktop.calls.isEmpty)
     }
 
     @Test(arguments: ["malformed", #"{"tokens":{"account_id":"wrong-workspace"}}"#])

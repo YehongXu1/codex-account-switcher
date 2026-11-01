@@ -3,8 +3,17 @@ import Foundation
 // The same ordered handoff and bounded restoration run on both platforms.
 
 public protocol DesktopControlling: Sendable {
+    func validateCloseRequest() async throws
     func closeDesktop() async throws
+    func recoverAfterCloseFailure() async throws
     func reopenDesktop() async throws
+}
+
+public extension DesktopControlling {
+    func validateCloseRequest() async throws {}
+    // A failed close may already have delivered a quit request. Implementations
+    // with asynchronous exits must also handle the original process exiting late.
+    func recoverAfterCloseFailure() async throws { try await reopenDesktop() }
 }
 
 public protocol CodexIdentityReading: Sendable {
@@ -67,9 +76,19 @@ public struct SwitchService: SwitchServicing {
                 guard await !store.activeCredentialExists() else { throw AccountStoreError.activeProfileMissing }
                 originalProfile = nil
             }
+            // Detect an external account change before disrupting any windows.
+            // The identity is checked again after suspension to cover races.
+            if let originalProfile {
+                let identity = try await codex.readIdentity(profileHome: await store.activeCodexHome())
+                guard identity.matches(originalProfile) else { throw AccountStoreError.activeCredentialMismatch }
+            }
         } catch {
             throw OperationError.stage(.saveCurrentCredential, error)
         }
+        // A helper launched by Desktop cannot safely close its own execution host.
+        // Reject that situation before creating a Herdr recovery journal.
+        do { try await desktop.validateCloseRequest() }
+        catch { throw OperationError.stage(.closeDesktop, error) }
         // Preflight all terminal sessions before closing anything or changing credentials.
         do { try await sessions.prepare() }
         catch { throw OperationError.stage(.prepareHerdr, error) }
@@ -141,7 +160,12 @@ public struct SwitchService: SwitchServicing {
             }
             // A post-commit Herdr failure keeps the selected account and its recovery journal.
             // Still reopen Desktop so the result and recovery controls remain reachable.
-            if desktopClosed && stage != .reopenDesktop && credentialsSafe {
+            if stage == .closeDesktop {
+                // closeDesktop can throw after requesting quit. No credentials
+                // have been changed, but Desktop may still disappear afterward.
+                do { try await desktop.recoverAfterCloseFailure() }
+                catch { recoveryFailures.append("Recovering Codex Desktop after the quit failure failed: \(error.localizedDescription)") }
+            } else if desktopClosed && stage != .reopenDesktop && credentialsSafe {
                 do { try await desktop.reopenDesktop() }
                 catch { recoveryFailures.append("Reopening Codex Desktop failed: \(error.localizedDescription)") }
             }

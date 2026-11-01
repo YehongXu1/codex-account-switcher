@@ -35,7 +35,8 @@ struct HerdrRoundtripCheck {
         let store = AccountStore()
         let identityReader = CredentialIdentity()
         let sessions = HerdrCoordinator()
-        let service = SwitchService(desktop: DesktopController(), store: store,
+        let desktop = DesktopController()
+        let service = SwitchService(desktop: desktop, store: store,
                                     codex: identityReader, sessions: sessions)
         var report: [String: Any] = ["mode": mode, "status": "started", "timestamp": timestamp()]
         if let requested { report["requestedProfileID"] = requested.uuidString }
@@ -101,6 +102,11 @@ struct HerdrRoundtripCheck {
                 if let stage = error.stage, [.prepareHerdr, .suspendHerdr, .resumeHerdr].contains(stage) {
                     report["handoffDiagnostic"] = error.message
                 }
+                if let stage = error.stage, [.closeDesktop, .reopenDesktop].contains(stage) {
+                    // These stages contain local lifecycle diagnostics only. Keep
+                    // the failure reason instead of reporting just "closeDesktop".
+                    report["desktopDiagnostic"] = error.message
+                }
             }
             if let error = error as? HerdrCoordinatorError { report["handoffDiagnostic"] = error.localizedDescription }
             if let error = error as? CheckError { report["errorCategory"] = error.rawValue }
@@ -115,6 +121,13 @@ struct HerdrRoundtripCheck {
                 report["observedAccountID"] = observed.accountID
             }
             // Never forward localizedDescription / underlyingDescription from auth or RPC errors.
+            try? write(report, to: output)
+            // The menu-bar app remains alive after failure, but this helper
+            // otherwise exits while a delayed quit/reopen is still pending.
+            // Await without blocking NSApplication's event loop; even a stalled
+            // reopen is bounded, and the original operation still fails.
+            report["desktopRecovery"] = await desktop.waitForCloseFailureRecovery().rawValue
+            report["timestamp"] = timestamp()
             try? write(report, to: output)
             printJSON(report)
             exit(1)

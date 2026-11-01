@@ -24,6 +24,29 @@ Require the `Test run with ... tests ... passed` summary before treating the sui
 
 ## 2. Unit tests
 
+### Herdr and Desktop handoff recovery
+
+The handoff tests use fake processes and temporary credentials; they must not close a
+real Desktop app or send input to an existing Herdr session. The native menu-bar
+app owns the production handoff. A helper launched under Codex Desktop must refuse
+to close its own ancestor, rather than relying on a shell script surviving that exit.
+
+Regression coverage includes both Codex empty prompt glyphs (`›` and `»`), passive
+warning footers, rejection of drafts and transcript navigation, and restoration of
+the original thread UUID. Shared-core tests cover rejection before any side effect,
+quit failures before credential mutation, Desktop recovery even when quit confirmation
+fails, and preservation of both the primary and recovery errors. An external account
+change is rejected before closing Desktop and is checked again before saving credentials.
+
+`HerdrRoundtripCheck` reports sanitized `desktopDiagnostic` details on lifecycle
+failures and keeps its AppKit run loop alive while pending late-exit recovery finishes,
+with a bounded wait and a separate `desktopRecovery` result. The menu-bar app observes
+accepted quit requests for up to 120 seconds and refuses another switch while recovery
+is pending. Do not replace the Homebrew `herdr` executable, issue kill signals, or
+ignore failed preflight commands to make a live check pass. A passing simulated test
+suite does not certify a real cross-account handoff; that remains a separate user-directed
+operation after installation.
+
 ### macOS account popover sizing (v0.1.18)
 
 `MenuBarPopoverTests` measures the production SwiftUI view with 0, 1, 2, 3, 4, and 20 saved accounts, with five-hour usage both hidden and shown. The initial zero-height proposal and the sizes left by account management and settings must yield the same home height. One through three accounts increase the height; four and twenty retain the three-account viewport.
