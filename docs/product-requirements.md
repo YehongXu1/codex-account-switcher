@@ -188,7 +188,7 @@ After confirmation, disable additional account actions while the six-stage opera
 - `Saving selected account…`
 - `Opening Codex Desktop…`
 
-If Codex Desktop displays its quit warning for active local chats, the user handles that native dialog. The switcher waits up to 30 seconds for normal exit and never force-quits Desktop. A rejected quit request or timeout stops the switch before credentials change, preserving Desktop's opportunity to flush task history. The user can finish or stop tasks and close Desktop before switching again.
+If Codex Desktop displays its quit warning for active local chats, the user handles that native dialog. The switcher waits up to 2 minutes for normal exit and never force-quits Desktop. A rejected quit request or timeout stops the switch before credentials change, preserving Desktop's opportunity to flush task history. The user can finish or stop tasks and close Desktop before switching again.
 
 The stages are not configurable. A failure banner identifies the failed stage and retains the underlying diagnostic message.
 

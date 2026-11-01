@@ -403,7 +403,7 @@ func open() async throws
 
 Use `NSRunningApplication` for the Codex Desktop bundle identifier and call `terminate()`.
 
-Codex Desktop can display a quit confirmation while work is active. Allow up to 30 seconds for its normal exit, including its history and settings flush. Never force-terminate Desktop. If the quit request is rejected or Desktop remains running, report a close-stage error before saving or replacing credentials. The user can finish or stop active tasks, close Desktop, and switch again. Cancellation also stops the wait.
+Codex Desktop can display a quit confirmation while work is active. Allow up to 2 minutes for its normal exit, including its history and settings flush. Never force-terminate Desktop. If the quit request is rejected or Desktop remains running, report a close-stage error before saving or replacing credentials. The user can finish or stop active tasks, close Desktop, and switch again. Cancellation also stops the wait.
 
 The switcher only observes the Desktop application's exit; it does not terminate CLI processes or claim to repair Codex's history database. Account RPCs read the login shell's `PATH` and shared `CODEX_CLI_PATH` setting. A bare command such as `codex` resolves through that PATH; an explicit absolute path must be executable. The child receives the same PATH so npm launchers can find Node. Without an override or executable PATH command, macOS checks the installed Desktop app layouts described in section 8.
 

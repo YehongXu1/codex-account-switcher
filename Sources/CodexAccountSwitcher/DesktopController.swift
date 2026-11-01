@@ -19,7 +19,7 @@ enum DesktopControllerError: LocalizedError, Sendable {
         case .quitRequestFailed:
             "Codex Desktop rejected the quit request."
         case .didNotExit:
-            "Codex Desktop did not finish quitting within 30 seconds. Finish or stop active tasks and close Desktop, then switch again. The account has not changed."
+            "Codex Desktop did not finish quitting within 2 minutes. If its Quit / Cancel dialog is open, complete or cancel it. Finish or stop active tasks before switching again. The account has not changed."
         case .reopenFailed:
             "Codex Desktop could not be reopened. Open it manually to continue."
         case .executionHost:
@@ -137,7 +137,10 @@ struct DesktopRecoveryWaiter: Sendable {
 // A quit request may be waiting for Desktop's active-task dialog or durable history writes.
 // Expiry must stop the switch before credentials change; it must never escalate to SIGKILL.
 struct DesktopQuitWaiter: Sendable {
-    var timeout: Duration = .seconds(30)
+    // Desktop's native confirmation can remain open while a person decides.
+    // Allow time to handle it without treating a later normal exit as failure.
+    // This does not dismiss or bypass the confirmation.
+    var timeout: Duration = .seconds(120)
     var pollInterval: Duration = .milliseconds(100)
 
     func wait(isRunning: @Sendable () async -> Bool) async throws {

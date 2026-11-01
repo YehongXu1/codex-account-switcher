@@ -225,7 +225,7 @@ With two real test accounts:
 5. confirm the status bar matches 5-hour remaining Usage by default, switch Status Bar Usage to weekly and verify its weekly value, then confirm an account without 5-hour data uses the weekly value;
 6. start a Codex CLI under A;
 7. switch A → B;
-8. with an active local chat, leave Desktop's native quit dialog pending and confirm a close-stage error after 30 seconds, with account A still active and Desktop still running; then finish or stop the task and close Desktop normally;
+8. with an active local chat, leave Desktop's native quit dialog pending and confirm a close-stage error after 2 minutes, with account A still active and Desktop still running; then finish or stop the task and close Desktop normally;
 9. switch again and confirm Desktop reopens as B; reopen existing tasks and check their earlier and latest messages;
 10. confirm the existing CLI was not terminated;
 11. start a new CLI and confirm it uses B;
@@ -277,3 +277,5 @@ New regression cases cover external-login contamination, successful RPC response
 Public release acceptance still requires a signed feed, an increasing Sparkle build version, and a real download/install/relaunch test. Delegate simulations and local codesign verification do not establish those outcomes.
 
 Release follow-up: the full runner now executes 54 tests, including parameterized first-activation success and failure cases. An isolated Sparkle app completed a real signed download/install/relaunch from 0.1.7 to 0.1.8; see the ablation report for the fixture boundaries.
+
+The Herdr confirmation also calls out Desktop's native Quit / Cancel dialog. During the real 2026-11-01 check, the old Desktop remained open for roughly 42 seconds; the previous 30-second wait aborted before it exited. The 2-minute limit permits delayed confirmation but does not automate that dialog. A pending or canceled dialog must still prevent credential changes, and a late exit after timeout must still reopen Desktop under the unchanged account.
