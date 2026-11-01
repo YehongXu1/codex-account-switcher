@@ -148,7 +148,9 @@ struct DesktopControllerTests {
 
     @Test func helperWaitsForAsynchronousReopenAfterObservationEnds() async {
         let statuses = RecoveryStatusSequence([.waitingForExit, .reopening, .reopening, .reopened])
-        let result = await DesktopRecoveryWaiter(timeout: .seconds(1), pollInterval: .milliseconds(1))
+        // Test the state sequence, not CI scheduling latency. The separate zero-
+        // deadline test checks timeout behavior without depending on wall time.
+        let result = await DesktopRecoveryWaiter(timeout: .seconds(30), pollInterval: .milliseconds(1))
             .wait { await statuses.next() }
         #expect(result == .reopened)
         #expect(await statuses.readCount == 4)
@@ -156,7 +158,7 @@ struct DesktopControllerTests {
 
     @Test func helperReportsReopenFailureInsteadOfClaimingRecovery() async {
         let statuses = RecoveryStatusSequence([.waitingForExit, .reopening, .reopenFailed])
-        let result = await DesktopRecoveryWaiter(timeout: .seconds(1), pollInterval: .milliseconds(1))
+        let result = await DesktopRecoveryWaiter(timeout: .seconds(30), pollInterval: .milliseconds(1))
             .wait { await statuses.next() }
         #expect(result == .reopenFailed)
     }
