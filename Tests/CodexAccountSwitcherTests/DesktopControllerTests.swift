@@ -88,13 +88,16 @@ struct DesktopControllerTests {
     @Test func reopenTimeoutReleasesRecoveryAndIgnoresLateCompletion() {
         var recovery = DesktopRecoveryState()
         let generation = recovery.beginWaiting()
-        #expect(recovery.transition(generation: generation, from: .waitingForExit, to: .reopening))
+        let started = recovery.transition(generation: generation, from: .waitingForExit, to: .reopening)
+        #expect(started)
         #expect(recovery.status.isPending)
-        #expect(recovery.transition(generation: generation, from: .reopening, to: .reopenTimedOut))
+        let timedOut = recovery.transition(generation: generation, from: .reopening, to: .reopenTimedOut)
+        #expect(timedOut)
         #expect(!recovery.status.isPending)
 
         for completion in [DesktopRecoveryStatus.reopened, .reopenFailed] {
-            #expect(!recovery.transition(generation: generation, from: .reopening, to: completion))
+            let accepted = recovery.transition(generation: generation, from: .reopening, to: completion)
+            #expect(!accepted)
             #expect(recovery.status == .reopenTimedOut)
         }
     }
@@ -108,14 +111,18 @@ struct DesktopControllerTests {
         let retryGeneration = recovery.beginWaiting()
         #expect(!recovery.isWaiting(generation: oldGeneration))
         #expect(recovery.isWaiting(generation: retryGeneration))
-        #expect(!recovery.transition(generation: oldGeneration, from: .waitingForExit,
-                                    to: .desktopStillRunning))
-        #expect(recovery.transition(generation: retryGeneration, from: .waitingForExit, to: .reopening))
+        let expiredOldAttempt = recovery.transition(generation: oldGeneration, from: .waitingForExit,
+                                                    to: .desktopStillRunning)
+        #expect(!expiredOldAttempt)
+        let retried = recovery.transition(generation: retryGeneration, from: .waitingForExit, to: .reopening)
+        #expect(retried)
         for staleResult in [DesktopRecoveryStatus.reopened, .reopenFailed, .reopenTimedOut] {
-            #expect(!recovery.transition(generation: oldGeneration, from: .reopening, to: staleResult))
+            let accepted = recovery.transition(generation: oldGeneration, from: .reopening, to: staleResult)
+            #expect(!accepted)
             #expect(recovery.status == .reopening)
         }
-        #expect(recovery.transition(generation: retryGeneration, from: .reopening, to: .reopened))
+        let completed = recovery.transition(generation: retryGeneration, from: .reopening, to: .reopened)
+        #expect(completed)
         #expect(recovery.status == .reopened)
     }
 
@@ -124,7 +131,8 @@ struct DesktopControllerTests {
         let generation = recovery.beginWaiting()
         recovery.transition(generation: generation, from: .waitingForExit, to: .reopening)
         recovery.transition(generation: generation, from: .reopening, to: .reopened)
-        #expect(!recovery.transition(generation: generation, from: .reopening, to: .reopenTimedOut))
+        let expired = recovery.transition(generation: generation, from: .reopening, to: .reopenTimedOut)
+        #expect(!expired)
         #expect(recovery.status == .reopened)
     }
 
@@ -133,7 +141,8 @@ struct DesktopControllerTests {
         let generation = recovery.beginWaiting()
         recovery.reset()
         #expect(!recovery.isWaiting(generation: generation))
-        #expect(!recovery.transition(generation: generation, from: .waitingForExit, to: .reopening))
+        let accepted = recovery.transition(generation: generation, from: .waitingForExit, to: .reopening)
+        #expect(!accepted)
         #expect(recovery.status == .notNeeded)
     }
 
