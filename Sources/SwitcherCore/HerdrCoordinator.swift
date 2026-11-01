@@ -333,7 +333,9 @@ public actor HerdrCoordinator: HerdrSessionCoordinating {
 
     /// Herdr's SessionStart hook can be absent after resume. An open rollout file
     /// identifies the loaded conversation even if `/resume` changed it since launch.
-    /// Only descriptor paths are read; transcript contents are never inspected.
+    /// Multiple open rollouts are accepted only when their first session_meta
+    /// records prove one root and a complete tree of its subagents. Transcript
+    /// records are never decoded or used to infer conversation identity.
     private func threadID(pane: Pane, process: ForegroundProcess, duringRecovery: Bool = false) async throws -> String? {
         let reported: String?
         if let session = pane.agentSession {
@@ -350,11 +352,17 @@ public actor HerdrCoordinator: HerdrSessionCoordinating {
         } else {
             files = try await runner.run(URL(fileURLWithPath: "/usr/sbin/lsof"), ["-nP", "-a", "-p", String(process.pid), "-Fn"])
         }
-        let runtimeIDs = Self.runtimeThreadIDs(from: files, home: activeHome)
-        guard runtimeIDs.count <= 1 else {
-            throw failure("\(pane.paneID) 同时打开了多条对话记录，无法确认应恢复哪一条。")
+        let runtimeFiles = Self.runtimeThreadFiles(from: files, home: activeHome)
+        let runtimeID: String?
+        if runtimeFiles.count > 1 {
+            guard let root = Self.verifiedRuntimeRoot(in: runtimeFiles) else {
+                throw failure("\(pane.paneID) 同时打开了多条对话记录，无法确认主对话和完整子代理关系。")
+            }
+            runtimeID = root
+        } else {
+            runtimeID = runtimeFiles.keys.first
         }
-        if let runtime = runtimeIDs.first {
+        if let runtime = runtimeID {
             if let reported, reported != runtime {
                 throw failure("\(pane.paneID) 的运行中对话与 Herdr 标识不一致，已停止自动处理。")
             }
@@ -364,22 +372,104 @@ public actor HerdrCoordinator: HerdrSessionCoordinating {
     }
 
     static func runtimeThreadIDs(from output: String, home: URL) -> Set<String> {
+        Set(runtimeThreadFiles(from: output, home: home).keys)
+    }
+
+    private static func runtimeThreadFiles(from output: String, home: URL) -> [String: Set<URL>] {
         let root = home.standardizedFileURL.resolvingSymlinksInPath()
         let directories = ["sessions", "archived_sessions"].map {
             root.appendingPathComponent($0).path + "/"
         }
         let pattern = #"^rollout-.+-([0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12})\.jsonl$"#
-        guard let expression = try? NSRegularExpression(pattern: pattern) else { return [] }
-        var result = Set<String>()
+        guard let expression = try? NSRegularExpression(pattern: pattern) else { return [:] }
+        var result: [String: Set<URL>] = [:]
         for field in output.components(separatedBy: .newlines) where field.hasPrefix("n/") {
             let path = URL(fileURLWithPath: String(field.dropFirst())).standardizedFileURL.resolvingSymlinksInPath()
             guard directories.contains(where: { path.path.hasPrefix($0) }) else { continue }
             let name = path.lastPathComponent
             guard let match = expression.firstMatch(in: name, range: NSRange(name.startIndex..., in: name)),
                   let range = Range(match.range(at: 1), in: name), let id = UUID(uuidString: String(name[range])) else { continue }
-            result.insert(id.uuidString.lowercased())
+            result[id.uuidString.lowercased(), default: []].insert(path)
         }
         return result
+    }
+
+    /// Metadata is evidence only when all opened rollouts agree. Neither an argv
+    /// resume target nor a stale hook is allowed to select one of several roots.
+    private static func verifiedRuntimeRoot(in files: [String: Set<URL>]) -> String? {
+        guard files.count > 1, files.count <= 64 else { return nil }
+        var parents: [String: String] = [:]
+        var roots: [String] = []
+        for (id, paths) in files {
+            // Repeated descriptors of one file are harmless; distinct files
+            // claiming the same UUID cannot establish an unambiguous tree.
+            guard paths.count == 1, let path = paths.first,
+                  let metadata = rolloutMetadata(at: path), metadata.id == id else { return nil }
+            if let parent = metadata.parent { parents[id] = parent }
+            else { roots.append(id) }
+        }
+        guard roots.count == 1, let root = roots.first else { return nil }
+        for id in parents.keys {
+            var current = id
+            var visited = Set<String>()
+            while current != root {
+                guard visited.insert(current).inserted, let parent = parents[current] else { return nil }
+                current = parent
+            }
+        }
+        return root
+    }
+
+    private struct RolloutMetadata {
+        let id: String
+        let parent: String?
+    }
+
+    private static func rolloutMetadata(at url: URL) -> RolloutMetadata? {
+        // Session metadata can contain long instruction strings. Bound the
+        // first line independently of the (potentially very large) transcript.
+        guard let attributes = try? FileManager.default.attributesOfItem(atPath: url.path),
+              attributes[.type] as? FileAttributeType == .typeRegular,
+              let handle = try? FileHandle(forReadingFrom: url) else { return nil }
+        defer { try? handle.close() }
+        let maximumBytes = 1_048_576
+        var firstLine = Data()
+        var terminated = false
+        do {
+            while firstLine.count < maximumBytes {
+                guard let chunk = try handle.read(upToCount: min(4_096, maximumBytes - firstLine.count)),
+                      !chunk.isEmpty else { return nil }
+                if let newline = chunk.firstIndex(of: 0x0a) {
+                    firstLine.append(chunk.prefix(upTo: newline))
+                    terminated = true
+                    break
+                }
+                firstLine.append(chunk)
+            }
+        } catch { return nil }
+        guard terminated,
+              let record = try? JSONSerialization.jsonObject(with: firstLine) as? [String: Any],
+              record["type"] as? String == "session_meta",
+              let payload = record["payload"] as? [String: Any],
+              let id = normalizedThreadID(payload["id"]) else { return nil }
+        if let source = payload["source"] as? String {
+            guard ["cli", "vscode"].contains(source),
+                  payload["parent_thread_id"] == nil, payload["forked_from_id"] == nil else { return nil }
+            return RolloutMetadata(id: id, parent: nil)
+        }
+        guard let source = payload["source"] as? [String: Any], source.count == 1,
+              let subagent = source["subagent"] as? [String: Any], subagent.count == 1,
+              let spawn = subagent["thread_spawn"] as? [String: Any],
+              let parent = normalizedThreadID(spawn["parent_thread_id"]) else { return nil }
+        for key in ["parent_thread_id", "forked_from_id"] {
+            if let claimed = payload[key], normalizedThreadID(claimed) != parent { return nil }
+        }
+        return RolloutMetadata(id: id, parent: parent)
+    }
+
+    private static func normalizedThreadID(_ value: Any?) -> String? {
+        guard let string = value as? String else { return nil }
+        return UUID(uuidString: string)?.uuidString.lowercased()
     }
 
     private func verifyFreshProcess(_ process: ForegroundProcess, record: Record, duringRecovery: Bool = false) async throws {

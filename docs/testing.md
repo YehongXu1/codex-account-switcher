@@ -38,6 +38,12 @@ quit failures before credential mutation, Desktop recovery even when quit confir
 fails, and preservation of both the primary and recovery errors. An external account
 change is rejected before closing Desktop and is checked again before saving credentials.
 
+One Codex process can keep its root rollout and subagent rollouts open together.
+The coordinator accepts these only when bounded first-line `session_meta` records
+prove exactly one root and a complete subagent parent tree. Conflicting roots,
+missing parent links, malformed metadata, and hook/launch mismatches still block
+the switch before any quit request; transcript bodies are not decoded.
+
 `HerdrRoundtripCheck` reports sanitized `desktopDiagnostic` details on lifecycle
 failures and keeps its AppKit run loop alive while pending late-exit recovery finishes,
 with a bounded wait and a separate `desktopRecovery` result. The menu-bar app observes

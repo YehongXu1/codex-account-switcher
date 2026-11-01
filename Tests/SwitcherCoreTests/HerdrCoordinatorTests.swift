@@ -271,6 +271,159 @@ struct HerdrCoordinatorTests {
         #expect(await fixture.runner.mutations().isEmpty)
     }
 
+    @Test(arguments: [false, true])
+    func verifiedSubagentTreeKeepsExactRootConversation(_ hideHook: Bool) async throws {
+        let fixture = try Fixture()
+        defer { fixture.clean() }
+        let root = fixture.ids[0]
+        let child = UUID().uuidString.lowercased()
+        let sibling = UUID().uuidString.lowercased()
+        let grandchild = UUID().uuidString.lowercased()
+        try fixture.writeRollout(root, payload: ["id": root, "source": hideHook ? "cli" : "vscode"])
+        try fixture.writeRollout(child, payload: Fixture.subagentPayload(child, parent: root))
+        try fixture.writeRollout(sibling, payload: Fixture.subagentPayload(sibling, parent: root))
+        var nested = Fixture.subagentPayload(grandchild, parent: child)
+        // Optional corroborating fields may be absent; source must still prove
+        // the complete immediate-parent chain among the open files.
+        nested.removeValue(forKey: "parent_thread_id")
+        nested.removeValue(forKey: "forked_from_id")
+        try fixture.writeRollout(grandchild, payload: nested, suffix: "not JSON: transcript body must never be parsed\n")
+        await fixture.runner.setRuntimeThreads([grandchild, sibling, root, child, child])
+        if hideHook { await fixture.runner.hideSessionMetadata() }
+        try await fixture.coordinator.prepare()
+        #expect(await fixture.runner.mutations().isEmpty)
+        let metadata = try String(contentsOf: fixture.journal, encoding: .utf8)
+        #expect(metadata.contains(root))
+        #expect(!metadata.contains(child))
+        try await fixture.coordinator.suspend()
+        try await fixture.coordinator.resume()
+        #expect(await fixture.runner.quits() == ["w1:p1"])
+        #expect(await fixture.runner.starts().first?.contains("resume '\(root)'") == true)
+        #expect(!(await fixture.coordinator.hasPendingRecovery()))
+    }
+
+    @Test(arguments: [false, true])
+    func verifiedTreeStillRejectsConflictingHookOrResumeArgument(_ hideHook: Bool) async throws {
+        let fixture = try Fixture()
+        defer { fixture.clean() }
+        let root = fixture.ids[0]
+        let child = UUID().uuidString.lowercased()
+        try fixture.writeRollout(root, payload: ["id": root, "source": "vscode"])
+        try fixture.writeRollout(child, payload: Fixture.subagentPayload(child, parent: root))
+        await fixture.runner.setRuntimeThreads([root, child])
+        await fixture.runner.setThread("w1:p1", child)
+        if hideHook { await fixture.runner.hideSessionMetadata() }
+        await #expect(throws: (any Error).self) { try await fixture.coordinator.prepare() }
+        #expect(await fixture.runner.mutations().isEmpty)
+        #expect(!FileManager.default.fileExists(atPath: fixture.journal.path))
+    }
+
+    @Test(arguments: ["multiple-roots", "no-root", "unknown-source", "unknown-subagent", "missing-source", "missing-parent",
+                      "missing-chain-link", "cycle", "self-parent", "mismatched-id", "mismatched-parent",
+                      "mismatched-fork", "invalid-parent", "null-parent", "root-with-parent", "wrong-record-type",
+                      "malformed-json", "missing-newline", "oversized-header", "missing-file"])
+    func unverifiedRolloutRelationshipsBlockBeforeAnyQuit(_ scenario: String) async throws {
+        let fixture = try Fixture()
+        defer { fixture.clean() }
+        let root = fixture.ids[0]
+        let child = UUID().uuidString.lowercased()
+        let other = UUID().uuidString.lowercased()
+        var rootPayload: [String: Any] = ["id": root, "source": "vscode"]
+        var childPayload = Fixture.subagentPayload(child, parent: root)
+        var threads = [root, child]
+        var recordType = "session_meta"
+        switch scenario {
+        case "multiple-roots": childPayload = ["id": child, "source": "cli"]
+        case "no-root": rootPayload = Fixture.subagentPayload(root, parent: child)
+        case "unknown-source": rootPayload["source"] = "unknown"
+        case "unknown-subagent": childPayload["source"] = ["subagent": "review"]
+        case "missing-source": rootPayload.removeValue(forKey: "source")
+        case "missing-parent": childPayload["source"] = ["subagent": ["thread_spawn": [:]]]
+        case "missing-chain-link": childPayload = Fixture.subagentPayload(child, parent: other)
+        case "cycle":
+            childPayload = Fixture.subagentPayload(child, parent: other)
+            try fixture.writeRollout(other, payload: Fixture.subagentPayload(other, parent: child))
+            threads.append(other)
+        case "self-parent": childPayload = Fixture.subagentPayload(child, parent: child)
+        case "mismatched-id": childPayload["id"] = other
+        case "mismatched-parent": childPayload["parent_thread_id"] = other
+        case "mismatched-fork": childPayload["forked_from_id"] = other
+        case "invalid-parent": childPayload["parent_thread_id"] = 123
+        case "null-parent": childPayload["parent_thread_id"] = NSNull()
+        case "root-with-parent": rootPayload["parent_thread_id"] = other
+        case "wrong-record-type": recordType = "response_item"
+        default: break
+        }
+        try fixture.writeRollout(root, payload: rootPayload)
+        try fixture.writeRollout(child, payload: childPayload, type: recordType)
+        let childURL = fixture.rolloutURL(child)
+        switch scenario {
+        case "malformed-json": try Data("{not json}\n".utf8).write(to: childURL)
+        case "missing-newline":
+            let data = try Data(contentsOf: childURL)
+            try Data(data.dropLast()).write(to: childURL)
+        case "oversized-header":
+            let data = try Data(contentsOf: childURL)
+            try (Data(repeating: 0x20, count: 1_048_576) + data).write(to: childURL)
+        case "missing-file": try FileManager.default.removeItem(at: childURL)
+        default: break
+        }
+        await fixture.runner.setRuntimeThreads(threads)
+        await #expect(throws: (any Error).self) { try await fixture.coordinator.prepare() }
+        #expect(await fixture.runner.mutations().isEmpty)
+        #expect(!FileManager.default.fileExists(atPath: fixture.journal.path))
+    }
+
+    @Test func changedSubagentMetadataAfterPreparePreventsQuit() async throws {
+        let fixture = try Fixture()
+        defer { fixture.clean() }
+        let root = fixture.ids[0]
+        let child = UUID().uuidString.lowercased()
+        try fixture.writeRollout(root, payload: ["id": root, "source": "vscode"])
+        try fixture.writeRollout(child, payload: Fixture.subagentPayload(child, parent: root))
+        await fixture.runner.setRuntimeThreads([root, child])
+        try await fixture.coordinator.prepare()
+        try fixture.writeRollout(child, payload: ["id": child, "source": "cli"])
+        await #expect(throws: (any Error).self) { try await fixture.coordinator.suspend() }
+        #expect(await fixture.runner.mutations().isEmpty)
+        try await fixture.coordinator.resume()
+        #expect(!(await fixture.coordinator.hasPendingRecovery()))
+    }
+
+    @Test func distinctFilesClaimingOneUUIDBlockTreeDisambiguation() async throws {
+        let fixture = try Fixture()
+        defer { fixture.clean() }
+        let root = fixture.ids[0]
+        let child = UUID().uuidString.lowercased()
+        try fixture.writeRollout(root, payload: ["id": root, "source": "vscode"])
+        try fixture.writeRollout(child, payload: Fixture.subagentPayload(child, parent: root))
+        let duplicate = fixture.rolloutURL(child).deletingLastPathComponent()
+            .appendingPathComponent("rollout-duplicate-\(child).jsonl")
+        try FileManager.default.copyItem(at: fixture.rolloutURL(child), to: duplicate)
+        await fixture.runner.setRuntimeThreads([root, child])
+        await fixture.runner.setExtraRuntimePaths([duplicate.path])
+        await #expect(throws: (any Error).self) { try await fixture.coordinator.prepare() }
+        #expect(await fixture.runner.mutations().isEmpty)
+        #expect(!FileManager.default.fileExists(atPath: fixture.journal.path))
+    }
+
+    @Test func excessiveRolloutCountBlocksBeforeReadingUnboundedMetadata() async throws {
+        let fixture = try Fixture()
+        defer { fixture.clean() }
+        let root = fixture.ids[0]
+        try fixture.writeRollout(root, payload: ["id": root, "source": "vscode"])
+        var threads = [root]
+        for _ in 0..<64 {
+            let child = UUID().uuidString.lowercased()
+            try fixture.writeRollout(child, payload: Fixture.subagentPayload(child, parent: root))
+            threads.append(child)
+        }
+        await fixture.runner.setRuntimeThreads(threads)
+        await #expect(throws: (any Error).self) { try await fixture.coordinator.prepare() }
+        #expect(await fixture.runner.mutations().isEmpty)
+        #expect(!FileManager.default.fileExists(atPath: fixture.journal.path))
+    }
+
     @Test func runtimePathsAreScopedAndDuplicatesDoNotCreateAmbiguity() {
         let id = UUID().uuidString.lowercased()
         let other = UUID().uuidString.lowercased()
@@ -343,6 +496,20 @@ private struct Fixture {
     func makeCoordinator() -> HerdrCoordinator {
         HerdrCoordinator(runner: runner, herdr: URL(fileURLWithPath: "/test/herdr"), activeHome: root, journalURL: journal)
     }
+    func rolloutURL(_ id: String) -> URL {
+        root.appendingPathComponent("sessions/2026/10/29/rollout-2026-10-29T12-00-00-\(id).jsonl")
+    }
+    func writeRollout(_ id: String, payload: [String: Any], type: String = "session_meta", suffix: String = "") throws {
+        let url = rolloutURL(id)
+        try FileManager.default.createDirectory(at: url.deletingLastPathComponent(), withIntermediateDirectories: true)
+        var data = try JSONSerialization.data(withJSONObject: ["type": type, "payload": payload])
+        data.append(contentsOf: ("\n" + suffix).utf8)
+        try data.write(to: url)
+    }
+    static func subagentPayload(_ id: String, parent: String) -> [String: Any] {
+        ["id": id, "source": ["subagent": ["thread_spawn": ["parent_thread_id": parent, "depth": 1]]],
+         "parent_thread_id": parent, "forked_from_id": parent]
+    }
     func clean() { try? FileManager.default.removeItem(at: root) }
 }
 
@@ -367,6 +534,7 @@ private actor FakeHerdr: HerdrCommandRunning {
     private var shellPrompt = "fixture@host repo %"
     private var metadataHidden = false
     private var runtimeThreads: [String]?
+    private var extraRuntimePaths: [String] = []
     private var failedStartupProbe: String?
     private var runtimeFileDelay = 0
     private var launchDelay = 0
@@ -387,6 +555,7 @@ private actor FakeHerdr: HerdrCommandRunning {
     func setShellPrompt(_ value: String) { shellPrompt = value }
     func hideSessionMetadata() { metadataHidden = true }
     func setRuntimeThreads(_ values: [String]) { runtimeThreads = values }
+    func setExtraRuntimePaths(_ values: [String]) { extraRuntimePaths = values }
     func failStartupProbe(_ name: String) { failedStartupProbe = name }
     func delayRuntimeFile(probes: Int) { runtimeFileDelay = probes }
     func delayNextLaunch(polls: Int) { launchDelay = polls }
@@ -408,9 +577,10 @@ private actor FakeHerdr: HerdrCommandRunning {
             let pid = Int(arguments[3])!
             let agent = agents.first { $0.pid == pid }!
             if agent.resumedByCoordinator, runtimeFileDelay > 0 { runtimeFileDelay -= 1; return "p\(pid)\n" }
-            return (runtimeThreads ?? [agent.thread]).map {
+            let paths = (runtimeThreads ?? [agent.thread]).map {
                 "n\(home)/sessions/2026/10/29/rollout-2026-10-29T12-00-00-\($0).jsonl"
-            }.joined(separator: "\n")
+            } + extraRuntimePaths.map { "n" + $0 }
+            return paths.joined(separator: "\n")
         }
         #expect(Array(arguments.prefix(2)) == ["--session", "yehong"])
         let args = Array(arguments.dropFirst(2))
