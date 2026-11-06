@@ -306,7 +306,7 @@ public actor HerdrCoordinator: HerdrSessionCoordinating {
         try sameTerminal(current, record)
         let info = try await processInfo(record.paneID)
         if let process = info.foregroundProcesses.first(where: { $0.isCodex }) {
-            guard try await threadID(pane: current, process: process) == record.threadID else {
+            guard try await threadID(pane: current, process: process, force: preparedForce) == record.threadID else {
                 throw failure("\(record.paneID) 正在运行另一条对话，未自动输入任何内容。")
             }
             if process.pid == record.pid {
@@ -368,7 +368,7 @@ public actor HerdrCoordinator: HerdrSessionCoordinating {
                 try sameTerminal(pane, record)
                 let info = try await recoveryProbe { try await processInfo(record.paneID) }
                 if let running = info.foregroundProcesses.first(where: { $0.isCodex }) {
-                    let actual = try await threadID(pane: pane, process: running, duringRecovery: true)
+                    let actual = try await threadID(pane: pane, process: running, duringRecovery: true, force: preparedForce)
                     if let actual, actual != record.threadID {
                         throw failure("\(record.paneID) 的对话 ID 与原记录不一致，请在窗口中检查。")
                     }
@@ -391,7 +391,7 @@ public actor HerdrCoordinator: HerdrSessionCoordinating {
     /// Multiple open rollouts are accepted only when their first session_meta
     /// records prove one root and a complete tree of its subagents. Transcript
     /// records are never decoded or used to infer conversation identity.
-    private func threadID(pane: Pane, process: ForegroundProcess, duringRecovery: Bool = false) async throws -> String? {
+    private func threadID(pane: Pane, process: ForegroundProcess, duringRecovery: Bool = false, force: Bool = false) async throws -> String? {
         let reported: String?
         if let session = pane.agentSession {
             guard session.agent == "codex", session.kind == "id", let id = UUID(uuidString: session.value) else {
@@ -410,10 +410,17 @@ public actor HerdrCoordinator: HerdrSessionCoordinating {
         let runtimeFiles = Self.runtimeThreadFiles(from: files, home: activeHome)
         let runtimeID: String?
         if runtimeFiles.count > 1 {
-            guard let root = Self.verifiedRuntimeRoot(in: runtimeFiles) else {
-                throw failure("\(pane.paneID) 同时打开了多条对话记录，无法确认主对话和完整子代理关系。")
+            if force, let reported {
+                // Herdr has already associated this pane with its root session.
+                // A Codex process may also keep child rollout files open; in forced
+                // mode the pane's explicit ID is the authoritative conversation.
+                runtimeID = reported
+            } else {
+                guard let root = Self.verifiedRuntimeRoot(in: runtimeFiles) else {
+                    throw failure("\(pane.paneID) 同时打开了多条对话记录，无法确认主对话和完整子代理关系。")
+                }
+                runtimeID = root
             }
-            runtimeID = root
         } else {
             runtimeID = runtimeFiles.keys.first
         }
@@ -570,7 +577,7 @@ public actor HerdrCoordinator: HerdrSessionCoordinating {
               let cwd = process.cwd ?? pane.foregroundCWD ?? pane.cwd, cwd.hasPrefix("/") else {
             throw failure("\(pane.paneID) 的 Codex 启动方式无法安全恢复，已停止切换。")
         }
-        guard let sessionID = try await threadID(pane: pane, process: process) else {
+        guard let sessionID = try await threadID(pane: pane, process: process, force: force) else {
             throw failure("\(pane.paneID) 没有可确认的原对话 ID，已停止切换。")
         }
         // Custom profiles/config arguments could select different auth stores. Do not silently drop them.
