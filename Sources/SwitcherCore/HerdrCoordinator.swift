@@ -681,7 +681,11 @@ public actor HerdrCoordinator: HerdrSessionCoordinating {
         guard lines[(promptIndex + 1)..<footer].allSatisfy({ $0.isEmpty }) else { return false }
         guard footer + 1 < lines.count else { return true }
         return lines[(footer + 1)...].allSatisfy { line in
-            line.isEmpty || line.range(of: #"^New activity · (?:↓ Back to bottom · esc|enter/esc latest · \? shortcuts(?:\s+⚠ [1-9]\d* warnings? · f2 to view)?)$"#, options: .regularExpression) != nil
+            line.isEmpty
+                || line.range(of: #"^\? for shortcuts(?:\s+⚠ [1-9]\d* warnings? · f2 to view)?$"#, options: .regularExpression) != nil
+                || line.range(of: #"^\d+% context left(?: · .*)?$"#, options: .regularExpression) != nil
+                || line.range(of: #"^New activity · (?:↓ Back to bottom · esc|enter/esc latest · \? shortcuts(?:\s+⚠ [1-9]\d* warnings? · f2 to view)?)$"#, options: .regularExpression) != nil
+                || (allowSelection && line.contains("copy & follow") && line.contains("esc clear"))
         }
     }
 
