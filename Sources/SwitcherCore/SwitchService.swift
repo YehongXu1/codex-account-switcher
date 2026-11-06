@@ -22,12 +22,16 @@ public protocol CodexIdentityReading: Sendable {
 
 public protocol SwitchServicing: Sendable {
     func switchAccount(to targetID: UUID) async throws
+    func switchAccount(to targetID: UUID, forceHerdr: Bool) async throws
     func hasPendingSessionRecovery() async -> Bool
     func sessionRecoveryStatus() async -> SessionRecoveryStatus
     func recoverSessions() async throws
 }
 
 public extension SwitchServicing {
+    func switchAccount(to targetID: UUID, forceHerdr: Bool) async throws {
+        try await switchAccount(to: targetID)
+    }
     func hasPendingSessionRecovery() async -> Bool { false }
     func sessionRecoveryStatus() async -> SessionRecoveryStatus {
         SessionRecoveryStatus(isPending: await hasPendingSessionRecovery())
@@ -62,6 +66,10 @@ public struct SwitchService: SwitchServicing {
     }
 
     public func switchAccount(to targetID: UUID) async throws {
+        try await switchAccount(to: targetID, forceHerdr: true)
+    }
+
+    public func switchAccount(to targetID: UUID, forceHerdr: Bool) async throws {
         let target: AccountProfile
         let originalActiveID: UUID?
         let originalProfile: AccountProfile?
@@ -96,7 +104,7 @@ public struct SwitchService: SwitchServicing {
         do { try await desktop.validateCloseRequest() }
         catch { throw OperationError.stage(.closeDesktop, error) }
         // Preflight all terminal sessions before closing anything or changing credentials.
-        do { try await sessions.prepare() }
+        do { try await sessions.prepare(force: forceHerdr) }
         catch { throw OperationError.stage(.prepareHerdr, error) }
 
         var stage = SwitchStage.closeDesktop
@@ -107,7 +115,7 @@ public struct SwitchService: SwitchServicing {
             try await desktop.closeDesktop()
             desktopClosed = true
             stage = .suspendHerdr
-            try await sessions.suspend()
+            try await sessions.suspend(force: forceHerdr)
             stage = .saveCurrentCredential
             if let originalProfile {
                 let identity = try await codex.readIdentity(profileHome: await store.activeCodexHome())

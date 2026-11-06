@@ -185,6 +185,39 @@ struct HerdrCoordinatorTests {
         #expect(!(await fixture.coordinator.hasPendingRecovery()))
     }
 
+    @Test func activityStatusChromeDoesNotBlockAnEmptyComposer() async throws {
+        let fixture = try Fixture()
+        defer { fixture.clean() }
+        await fixture.runner.setComposer("""
+        新的结果。
+        › earlier transcript text
+
+        New activity · ↓ Back to bottom · esc
+        » Ask Codex to do anything
+
+        GPT-6-Astra ultra · ~/Desktop/GRO-Paper-Workspace · 整理论文
+        New activity · enter/esc latest · ? shortcuts                                      ⚠ 4 warnings · f2 to view
+        """)
+        try await fixture.coordinator.prepare()
+        #expect(await fixture.runner.mutations().isEmpty)
+        try await fixture.coordinator.suspend()
+        try await fixture.coordinator.resume()
+        #expect(await fixture.runner.quits() == ["w1:p1"])
+        #expect(await fixture.runner.starts().count == 1)
+    }
+
+    @Test func forcedHandoffQuitsAnUnsentDraft() async throws {
+        let fixture = try Fixture()
+        defer { fixture.clean() }
+        await fixture.runner.setComposer("› unsent draft that the user explicitly chose to discard\nGPT-6-Astra ultra · ~/repo\n? for shortcuts")
+        try await fixture.coordinator.prepare(force: true)
+        try await fixture.coordinator.suspend(force: true)
+        try await fixture.coordinator.resume()
+        #expect(await fixture.runner.quits() == ["w1:p1"])
+        #expect(await fixture.runner.starts().count == 1)
+        #expect(!(await fixture.coordinator.hasPendingRecovery()))
+    }
+
     @Test(arguments: ["›", "»"])
     func draftAndTranscriptVariantsNeverReceiveQuit(_ glyph: String) async throws {
         let fixture = try Fixture()
@@ -195,7 +228,6 @@ struct HerdrCoordinatorTests {
             "\(glyph) Ask Codex to do anything\n  continued draft\n\(footer)\n? for shortcuts",
             "\(glyph) \n  multiline draft\n\(footer)\n? for shortcuts              ⚠ 1 warning · f2 to view",
             "\(glyph) Ask Codex to do anything\n\(footer)\nBrowsing transcript · ↑↓/jk scroll · ←→/hl prompts · ⌃t details · ↵ rewind · esc back",
-            "\(glyph) Ask Codex to do anything\n\(footer)\nNew activity · Earlier messages available.  enter/esc latest · ? shortcuts",
             "\(glyph) Ask Codex to do anything\n\(footer)\nesc again to edit previous message",
             "\(glyph) Ask Codex to do anything\n\(footer)\n? for shortcuts · unknown mode"
         ]

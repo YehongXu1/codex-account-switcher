@@ -19,12 +19,16 @@ public struct SessionRecoveryStatus: Equatable, Sendable {
 public protocol HerdrSessionCoordinating: Sendable {
     func prepare() async throws
     func suspend() async throws
+    func prepare(force: Bool) async throws
+    func suspend(force: Bool) async throws
     func resume() async throws
     func hasPendingRecovery() async -> Bool
     func recoveryStatus() async -> SessionRecoveryStatus
 }
 
 public extension HerdrSessionCoordinating {
+    func prepare(force: Bool) async throws { try await prepare() }
+    func suspend(force: Bool) async throws { try await suspend() }
     func recoveryStatus() async -> SessionRecoveryStatus {
         SessionRecoveryStatus(isPending: await hasPendingRecovery())
     }
@@ -139,6 +143,7 @@ public actor HerdrCoordinator: HerdrSessionCoordinating {
     // Keep the handoff precondition separate from the refreshable recovery cache.
     // A helper clearing/replacing the file after prepare must not make suspend a no-op.
     private var preparedJournalRevision: Data?
+    private var preparedForce = false
     private var operating = false
 
     public init(sessionName: String = "yehong", journalURL: URL? = nil) {
@@ -182,10 +187,13 @@ public actor HerdrCoordinator: HerdrSessionCoordinating {
         }
     }
 
-    public func prepare() async throws {
+    public func prepare() async throws { try await prepare(force: false) }
+
+    public func prepare(force: Bool) async throws {
         try beginOperation()
         defer { operating = false }
         preparedJournalRevision = nil
+        preparedForce = force
         try loadJournal()
         guard journal == nil else { throw failure("存在上次未完成的 Herdr 恢复，请先恢复原对话。") }
         guard sessionExists() else { return }
@@ -195,34 +203,37 @@ public actor HerdrCoordinator: HerdrSessionCoordinating {
             let info = try await processInfo(pane.paneID)
             let processes = info.foregroundProcesses.filter { $0.isCodex }
             guard !info.isShellOnly, pane.agent == "codex" || !processes.isEmpty else { continue }
-            let record = try await inspect(pane: pane, info: info)
+            let record = try await inspect(pane: pane, info: info, force: force)
             records.append(record)
         }
         guard !records.isEmpty else { return }
         let originalAccountID = try CredentialIdentity.read(from: activeHome)?.accountID
         journal = Journal(version: 1, sessionName: sessionName, originalAccountID: originalAccountID, records: records)
-        do { preparedJournalRevision = try persist() } catch { journal = nil; throw error }
+        do { preparedJournalRevision = try persist() } catch { journal = nil; preparedForce = false; throw error }
     }
 
-    public func suspend() async throws {
+    public func suspend() async throws { try await suspend(force: false) }
+
+    public func suspend(force: Bool) async throws {
         try beginOperation()
         defer { operating = false }
         try loadJournal(expectedRevision: preparedJournalRevision)
         guard let prepared = journal else { return }
+        let effectiveForce = force || preparedForce
         // Validate the entire group before exiting the first pane.
         for record in prepared.records {
             guard record.state == .prepared else { throw failure("Herdr 切换已开始，请先恢复原对话。") }
-            try await validateOriginal(record)
+            try await validateOriginal(record, force: effectiveForce)
         }
         for index in prepared.records.indices {
             let record = prepared.records[index]
             // Revalidate immediately before sending input, including draft and selection checks.
-            let current = try await validateOriginal(record)
+            let current = try await validateOriginal(record, force: effectiveForce)
             if current.needsSelectionClear {
                 _ = try await command(["agent", "send-keys", record.paneID, "esc"])
                 var selectionCleared = false
                 for _ in 0..<min(pollAttempts, 8) {
-                    let cleared = try await validateOriginal(record)
+                    let cleared = try await validateOriginal(record, force: effectiveForce)
                     if !cleared.needsSelectionClear { selectionCleared = true; break }
                     try await Task.sleep(for: pollDelay)
                 }
@@ -265,6 +276,7 @@ public actor HerdrCoordinator: HerdrSessionCoordinating {
         try loadJournal()
         guard let recovery = journal else {
             preparedJournalRevision = nil
+            preparedForce = false
             return
         }
         var failures: [String] = []
@@ -276,6 +288,7 @@ public actor HerdrCoordinator: HerdrSessionCoordinating {
             if FileManager.default.fileExists(atPath: journalURL.path) { try FileManager.default.removeItem(at: journalURL) }
             journal = nil
             preparedJournalRevision = nil
+            preparedForce = false
         } else {
             throw failure(failures.joined(separator: "\n"))
         }
@@ -546,8 +559,8 @@ public actor HerdrCoordinator: HerdrSessionCoordinating {
         return "env CODEX_HOME=" + quote(home) + " " + quote(executable) + " --no-daemon -C " + quote(cwd) + " resume " + quote(threadID)
     }
 
-    private func inspect(pane: Pane, info: ProcessInfo) async throws -> Record {
-        guard pane.agent == "codex", pane.isReady else {
+    private func inspect(pane: Pane, info: ProcessInfo, force: Bool = false) async throws -> Record {
+        guard pane.agent == "codex", force || pane.isReady else {
             throw failure("\(pane.paneID) 的 Codex 正在工作、等待审批或状态不明确，请先让它回到空闲输入界面。")
         }
         guard info.foregroundProcesses.count == 1, let process = info.foregroundProcesses.first,
@@ -572,20 +585,28 @@ public actor HerdrCoordinator: HerdrSessionCoordinating {
         guard URL(fileURLWithPath: home).standardizedFileURL.resolvingSymlinksInPath() == activeHome.standardizedFileURL.resolvingSymlinksInPath() else {
             throw failure("\(pane.paneID) 使用了不同的 CODEX_HOME，请先用标准登录目录重新打开该对话。")
         }
-        let output = try await command(["agent", "read", pane.paneID, "--source", "detection", "--lines", "40"])
-        let text = Self.readText(output)
-        guard Self.hasEmptyComposer(text, allowSelection: true) else {
-            throw failure("\(pane.paneID) 有未发送输入、文本选择或无法识别的界面，请清空输入并按 Esc 返回普通输入界面。")
+        let text: String?
+        do {
+            let output = try await command(["agent", "read", pane.paneID, "--source", "detection", "--lines", "40"])
+            text = Self.readText(output)
+        } catch {
+            if force { text = nil } else { throw error }
+        }
+        if let text, !force {
+            guard Self.hasEmptyComposer(text, allowSelection: true) else {
+                throw failure("\(pane.paneID) 有未发送输入、文本选择或无法识别的界面，请清空输入并按 Esc 返回普通输入界面。")
+            }
         }
         return Record(paneID: pane.paneID, terminalID: pane.terminalID, threadID: sessionID,
-                      cwd: cwd, executable: executable, codexHome: home, pid: process.pid, needsSelectionClear: Self.isKnownSelection(text), state: .prepared)
+                      cwd: cwd, executable: executable, codexHome: home, pid: process.pid,
+                      needsSelectionClear: text.map(Self.isKnownSelection) ?? false, state: .prepared)
     }
 
     @discardableResult
-    private func validateOriginal(_ record: Record) async throws -> Record {
+    private func validateOriginal(_ record: Record, force: Bool = false) async throws -> Record {
         let current = try await pane(record.paneID)
         try sameTerminal(current, record)
-        let checked = try await inspect(pane: current, info: processInfo(record.paneID))
+        let checked = try await inspect(pane: current, info: processInfo(record.paneID), force: force)
         guard checked.threadID == record.threadID, checked.pid == record.pid,
               checked.cwd == record.cwd, checked.codexHome == record.codexHome else {
             throw failure("\(record.paneID) 在检查后发生变化，已停止切换。")
@@ -645,22 +666,23 @@ public actor HerdrCoordinator: HerdrSessionCoordinating {
             guard allowSelection && isKnownSelection(output) else { return false }
             nonempty.removeLast()
         }
-        // Codex can append a passive warning count to the ordinary shortcuts row.
-        // Transcript navigation and other interactive footer states stay unrecognized.
-        if let last = nonempty.last,
-            lines[last].range(of: #"^\? for shortcuts(?:\s+⚠ [1-9]\d* warnings? · f2 to view)?$"#, options: .regularExpression) != nil
-            || lines[last].range(of: #"^\d+% context left(?: · .*)?$"#, options: .regularExpression) != nil {
-            nonempty.removeLast()
-        }
-        // The footer is one line at the bottom, not an arbitrary draft line starting with GPT.
-        guard let footer = nonempty.last,
+        // Codex may append passive activity/status chrome after the model footer.
+        // It does not change the composer, so locate the footer instead of requiring
+        // it to be the last line. Unknown interactive footer text remains rejected.
+        guard let footer = nonempty.last(where: {
+            lines[$0].range(of: #"^(?:GPT|gpt)-[A-Za-z0-9.-]+ (?:minimal|low|medium|high|xhigh|max|ultra) · .+$"#, options: .regularExpression) != nil
+        }),
               lines[footer].range(of: #"^(?:GPT|gpt)-[A-Za-z0-9.-]+ (?:minimal|low|medium|high|xhigh|max|ultra) · .+$"#, options: .regularExpression) != nil,
               // Both prompt glyphs are emitted by Codex. The glyph alone does not
               // establish an empty composer: validate its text and following rows.
               let promptIndex = lines[..<footer].lastIndex(where: { $0.hasPrefix("›") || $0.hasPrefix("»") }) else { return false }
         let prompt = lines[promptIndex].dropFirst().trimmingCharacters(in: .whitespaces)
         guard prompt.isEmpty || prompt == "Ask Codex to do anything" else { return false }
-        return lines[(promptIndex + 1)..<footer].allSatisfy { $0.isEmpty }
+        guard lines[(promptIndex + 1)..<footer].allSatisfy({ $0.isEmpty }) else { return false }
+        guard footer + 1 < lines.count else { return true }
+        return lines[(footer + 1)...].allSatisfy { line in
+            line.isEmpty || line.range(of: #"^New activity · (?:↓ Back to bottom · esc|enter/esc latest · \? shortcuts(?:\s+⚠ [1-9]\d* warnings? · f2 to view)?)$"#, options: .regularExpression) != nil
+        }
     }
 
     static func codexHome(from environment: String, defaultHome: String) -> String {

@@ -245,7 +245,7 @@ open class AccountController {
         }
     }
 
-    public func switchAccount(to id: UUID) async {
+    public func switchAccount(to id: UUID, forceHerdr: Bool = true) async {
         guard !isMutating else { return }
         isMutating = true
         await cancelUsageRefresh()
@@ -253,7 +253,7 @@ open class AccountController {
         do {
             try await syncActiveIdentity()
             guard id != activeAccountID else { return }
-            try await switchService.switchAccount(to: id)
+            try await switchService.switchAccount(to: id, forceHerdr: forceHerdr)
             apply(try await store.loadRegistry())
             await refreshSubscriptionSnapshots()
             activeIdentityConfirmed = true
