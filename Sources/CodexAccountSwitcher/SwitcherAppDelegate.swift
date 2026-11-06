@@ -19,8 +19,19 @@ final class SwitcherAppDelegate: NSObject, NSApplicationDelegate {
         tiboForecast.start()
         wakeObservation = NSWorkspace.shared.notificationCenter.publisher(for: NSWorkspace.didWakeNotification)
             .sink { [weak self] _ in
-                Task { @MainActor in self?.model.refreshWeeklyUsage() }
+                Task { @MainActor in
+                    await self?.model.refreshHerdrRecovery()
+                    self?.model.refreshWeeklyUsage()
+                }
             }
-        Task { await model.startBackgroundUsageRefresh() }
+        Task {
+            await model.startBackgroundUsageRefresh()
+            model.startBackgroundRecoveryRefresh()
+        }
+    }
+
+    func applicationWillTerminate(_ notification: Notification) {
+        model.stopBackgroundRecoveryRefresh()
+        model.stopBackgroundUsageRefresh()
     }
 }

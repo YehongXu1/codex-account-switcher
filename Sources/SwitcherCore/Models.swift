@@ -211,10 +211,14 @@ public struct OperationError: LocalizedError, Equatable, Sendable {
     public let messageKey: String?
     public let message: String
     public let underlyingDescription: String?
+    /// Combined failures may also describe an unresolved Desktop or credential
+    /// problem, so they must not disappear when only the Herdr journal changes.
+    public let isSessionRecoveryOnly: Bool
 
-    public init(stage: SwitchStage?, titleKey: String, messageKey: String?, message: String, underlyingDescription: String?) {
+    public init(stage: SwitchStage?, titleKey: String, messageKey: String?, message: String, underlyingDescription: String?, isSessionRecoveryOnly: Bool = false) {
         self.stage = stage; self.titleKey = titleKey; self.messageKey = messageKey
         self.message = message; self.underlyingDescription = underlyingDescription
+        self.isSessionRecoveryOnly = isSessionRecoveryOnly
     }
 
     public var errorDescription: String? {
@@ -231,7 +235,8 @@ public struct OperationError: LocalizedError, Equatable, Sendable {
             titleKey: "switch_failed",
             messageKey: nil,
             message: error.localizedDescription,
-            underlyingDescription: String(describing: error)
+            underlyingDescription: String(describing: error),
+            isSessionRecoveryOnly: stage == .resumeHerdr
         )
     }
 }

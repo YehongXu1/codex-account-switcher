@@ -3,12 +3,31 @@ import Foundation
 import Darwin
 #endif
 
+/// The revision is the recovery metadata itself, used only to detect an external
+/// change. Recovery metadata never contains authentication credentials.
+public struct SessionRecoveryStatus: Equatable, Sendable {
+    public let isPending: Bool
+    public let revision: Data?
+
+    public init(isPending: Bool, revision: Data? = nil) {
+        self.isPending = isPending
+        self.revision = revision
+    }
+}
+
 /// A credential handoff must not leave terminal clients using the previous identity.
 public protocol HerdrSessionCoordinating: Sendable {
     func prepare() async throws
     func suspend() async throws
     func resume() async throws
     func hasPendingRecovery() async -> Bool
+    func recoveryStatus() async -> SessionRecoveryStatus
+}
+
+public extension HerdrSessionCoordinating {
+    func recoveryStatus() async -> SessionRecoveryStatus {
+        SessionRecoveryStatus(isPending: await hasPendingRecovery())
+    }
 }
 
 public struct NoopHerdrCoordinator: HerdrSessionCoordinating {
@@ -117,6 +136,9 @@ public actor HerdrCoordinator: HerdrSessionCoordinating {
     private let pollDelay: Duration
     private let pollAttempts: Int
     private var journal: Journal?
+    // Keep the handoff precondition separate from the refreshable recovery cache.
+    // A helper clearing/replacing the file after prepare must not make suspend a no-op.
+    private var preparedJournalRevision: Data?
     private var operating = false
 
     public init(sessionName: String = "yehong", journalURL: URL? = nil) {
@@ -143,13 +165,29 @@ public actor HerdrCoordinator: HerdrSessionCoordinating {
     }
 
     public func hasPendingRecovery() async -> Bool {
-        journal != nil || FileManager.default.fileExists(atPath: journalURL.path)
+        await recoveryStatus().isPending
+    }
+
+    public func recoveryStatus() async -> SessionRecoveryStatus {
+        // A helper may have completed recovery or replaced the journal while the
+        // menu app stayed open. Never retain its previous snapshot between operations.
+        // An in-flight operation, however, owns its journal across actor reentrancy.
+        if !operating { journal = nil }
+        do {
+            let data = try readJournalData()
+            return SessionRecoveryStatus(isPending: data != nil || journal != nil, revision: data)
+        } catch {
+            // Unreadable/corrupt paths must remain visible and block a new switch.
+            return SessionRecoveryStatus(isPending: true)
+        }
     }
 
     public func prepare() async throws {
         try beginOperation()
         defer { operating = false }
-        guard !(await hasPendingRecovery()) else { throw failure("存在上次未完成的 Herdr 恢复，请先恢复原对话。") }
+        preparedJournalRevision = nil
+        try loadJournal()
+        guard journal == nil else { throw failure("存在上次未完成的 Herdr 恢复，请先恢复原对话。") }
         guard sessionExists() else { return }
         let snapshot = try await snapshot()
         var records: [Record] = []
@@ -163,13 +201,13 @@ public actor HerdrCoordinator: HerdrSessionCoordinating {
         guard !records.isEmpty else { return }
         let originalAccountID = try CredentialIdentity.read(from: activeHome)?.accountID
         journal = Journal(version: 1, sessionName: sessionName, originalAccountID: originalAccountID, records: records)
-        do { try persist() } catch { journal = nil; throw error }
+        do { preparedJournalRevision = try persist() } catch { journal = nil; throw error }
     }
 
     public func suspend() async throws {
         try beginOperation()
         defer { operating = false }
-        try loadJournal()
+        try loadJournal(expectedRevision: preparedJournalRevision)
         guard let prepared = journal else { return }
         // Validate the entire group before exiting the first pane.
         for record in prepared.records {
@@ -225,7 +263,10 @@ public actor HerdrCoordinator: HerdrSessionCoordinating {
         try beginOperation()
         defer { operating = false }
         try loadJournal()
-        guard let recovery = journal else { return }
+        guard let recovery = journal else {
+            preparedJournalRevision = nil
+            return
+        }
         var failures: [String] = []
         for index in recovery.records.indices {
             do { try await resumeRecord(index) }
@@ -234,6 +275,7 @@ public actor HerdrCoordinator: HerdrSessionCoordinating {
         if failures.isEmpty {
             if FileManager.default.fileExists(atPath: journalURL.path) { try FileManager.default.removeItem(at: journalURL) }
             journal = nil
+            preparedJournalRevision = nil
         } else {
             throw failure(failures.joined(separator: "\n"))
         }
@@ -654,12 +696,17 @@ public actor HerdrCoordinator: HerdrSessionCoordinating {
         operating = true
     }
     private func failure(_ message: String) -> HerdrCoordinatorError { .failure(message) }
-    private func loadJournal() throws {
-        guard journal == nil, FileManager.default.fileExists(atPath: journalURL.path) else { return }
-        let attributes = try FileManager.default.attributesOfItem(atPath: journalURL.path)
-        guard attributes[.type] as? FileAttributeType == .typeRegular else { throw failure("Herdr 恢复文件不是普通文件，请检查安装目录。") }
+    private func loadJournal(expectedRevision: Data? = nil) throws {
+        // Every operation begins with the authoritative disk snapshot. Clear the
+        // old one even if reading its replacement fails, so it can never be replayed.
+        journal = nil
+        let currentData = try readJournalData()
+        if let expectedRevision, currentData != expectedRevision {
+            throw failure("Herdr 准备记录已被其他操作清除或修改，已停止账号切换；请重新检查原对话后重试。")
+        }
+        guard let data = currentData else { return }
         let loaded: Journal
-        do { loaded = try JSONDecoder().decode(Journal.self, from: Data(contentsOf: journalURL)) }
+        do { loaded = try JSONDecoder().decode(Journal.self, from: data) }
         catch { throw failure("Herdr 恢复记录无法读取；请保留文件并检查原窗口。") }
         guard loaded.version == 1, loaded.sessionName == sessionName else { throw failure("Herdr 恢复记录版本或会话不匹配。") }
         for record in loaded.records {
@@ -674,8 +721,28 @@ public actor HerdrCoordinator: HerdrSessionCoordinating {
         }
         journal = loaded
     }
-    private func persist() throws {
-        guard let journal else { return }
+
+    private func readJournalData() throws -> Data? {
+        do {
+            let attributes = try FileManager.default.attributesOfItem(atPath: journalURL.path)
+            guard attributes[.type] as? FileAttributeType == .typeRegular else {
+                throw failure("Herdr 恢复文件不是普通文件，请检查安装目录。")
+            }
+            return try Data(contentsOf: journalURL)
+        } catch {
+            let nsError = error as NSError
+            // fileExists also returns false for permission errors. Only an actual
+            // missing file means recovery was cleared by another process.
+            if nsError.domain == NSCocoaErrorDomain,
+               nsError.code == NSFileReadNoSuchFileError || nsError.code == NSFileNoSuchFileError {
+                return nil
+            }
+            throw error
+        }
+    }
+    @discardableResult
+    private func persist() throws -> Data? {
+        guard let journal else { return nil }
         let fm = FileManager.default
         try fm.createDirectory(at: journalURL.deletingLastPathComponent(), withIntermediateDirectories: true)
         if fm.fileExists(atPath: journalURL.path) {
@@ -684,6 +751,7 @@ public actor HerdrCoordinator: HerdrSessionCoordinating {
         }
         let encoder = JSONEncoder()
         encoder.outputFormatting = [.prettyPrinted, .sortedKeys]
+        let data = try encoder.encode(journal)
         let temporary = journalURL.deletingLastPathComponent().appendingPathComponent(".herdr-recovery-\(UUID()).tmp")
         defer { try? fm.removeItem(at: temporary) }
         guard fm.createFile(atPath: temporary.path, contents: nil, attributes: [.posixPermissions: 0o600]) else {
@@ -692,7 +760,7 @@ public actor HerdrCoordinator: HerdrSessionCoordinating {
         try fm.setAttributes([.posixPermissions: 0o600], ofItemAtPath: temporary.path)
         let handle = try FileHandle(forWritingTo: temporary)
         do {
-            try handle.write(contentsOf: encoder.encode(journal))
+            try handle.write(contentsOf: data)
             try handle.synchronize()
             try handle.close()
         } catch { try? handle.close(); throw error }
@@ -702,6 +770,7 @@ public actor HerdrCoordinator: HerdrSessionCoordinating {
         if fm.fileExists(atPath: journalURL.path) { _ = try fm.replaceItemAt(journalURL, withItemAt: temporary) }
         else { try fm.moveItem(at: temporary, to: journalURL) }
         #endif
+        return data
     }
 
     private struct Journal: Codable, Sendable {

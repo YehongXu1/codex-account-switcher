@@ -35,6 +35,132 @@ struct HerdrCoordinatorTests {
         #expect(!FileManager.default.fileExists(atPath: fixture.journal.path))
     }
 
+    @Test func externalJournalRemovalClearsCachedRecoveryWithoutRestartingApp() async throws {
+        let fixture = try Fixture()
+        defer { fixture.clean() }
+        try await fixture.coordinator.prepare()
+        let pending = await fixture.coordinator.recoveryStatus()
+        #expect(pending.isPending)
+        #expect(pending.revision != nil)
+        try FileManager.default.removeItem(at: fixture.journal)
+        #expect(await fixture.coordinator.recoveryStatus() == SessionRecoveryStatus(isPending: false))
+        await #expect(throws: (any Error).self) { try await fixture.coordinator.suspend() }
+        try await fixture.coordinator.resume()
+        #expect(await fixture.runner.mutations().isEmpty)
+        // A subsequent switch must also be allowed, rather than blocked by old memory.
+        try await fixture.coordinator.prepare()
+        try await fixture.coordinator.resume()
+    }
+
+    @Test(arguments: [false, true])
+    func externalPreparedJournalChangeStopsHandoffBeforeAnyQuit(_ replacement: Bool) async throws {
+        let fixture = try Fixture(count: 2)
+        defer { fixture.clean() }
+        try await fixture.coordinator.prepare()
+        if replacement {
+            var metadata = try #require(JSONSerialization.jsonObject(with: Data(contentsOf: fixture.journal)) as? [String: Any])
+            let records = try #require(metadata["records"] as? [[String: Any]])
+            metadata["records"] = [records[0]]
+            try JSONSerialization.data(withJSONObject: metadata).write(to: fixture.journal, options: .atomic)
+        } else {
+            // A recovery helper sees only prepared records and clears them while
+            // the GUI is still waiting for Desktop to close.
+            try await fixture.makeCoordinator().resume()
+        }
+        // Passive refresh may clear the old cache, but must retain the handoff precondition.
+        _ = await fixture.coordinator.recoveryStatus()
+        await #expect(throws: (any Error).self) { try await fixture.coordinator.suspend() }
+        #expect(await fixture.runner.mutations().isEmpty)
+        try await fixture.coordinator.resume()
+        try await fixture.coordinator.prepare()
+        try await fixture.coordinator.suspend()
+        try await fixture.coordinator.resume()
+        #expect(await fixture.runner.starts().count == 2)
+    }
+
+    @Test func operationReloadsDeletedJournalEvenWithoutStatusRefresh() async throws {
+        let fixture = try Fixture()
+        defer { fixture.clean() }
+        try await fixture.coordinator.prepare()
+        try await fixture.coordinator.suspend()
+        try FileManager.default.removeItem(at: fixture.journal)
+        try await fixture.coordinator.resume()
+        #expect(await fixture.runner.starts().isEmpty)
+        #expect(!(await fixture.coordinator.hasPendingRecovery()))
+    }
+
+    @Test(arguments: [false, true])
+    func externalJournalReplacementSupersedesCachedRecords(_ refreshFirst: Bool) async throws {
+        let fixture = try Fixture(count: 2)
+        defer { fixture.clean() }
+        try await fixture.coordinator.prepare()
+        try await fixture.coordinator.suspend()
+        let previousRevision = try Data(contentsOf: fixture.journal)
+        var replacement = try #require(JSONSerialization.jsonObject(with: Data(contentsOf: fixture.journal)) as? [String: Any])
+        var records = try #require(replacement["records"] as? [[String: Any]])
+        records[0]["state"] = "resumed"
+        replacement["records"] = records
+        try JSONSerialization.data(withJSONObject: replacement).write(to: fixture.journal, options: .atomic)
+        if refreshFirst {
+            let current = await fixture.coordinator.recoveryStatus()
+            #expect(current.isPending)
+            #expect(current.revision != previousRevision)
+        }
+        try await fixture.coordinator.resume()
+        let commands = await fixture.runner.starts()
+        #expect(commands.count == 1)
+        #expect(commands.first?.contains("resume '\(fixture.ids[1])'") == true)
+    }
+
+    @Test(arguments: [false, true])
+    func invalidJournalReplacementNeverReplaysCachedRecords(_ directory: Bool) async throws {
+        let fixture = try Fixture()
+        defer { fixture.clean() }
+        try await fixture.coordinator.prepare()
+        try await fixture.coordinator.suspend()
+        if directory {
+            try FileManager.default.removeItem(at: fixture.journal)
+            try FileManager.default.createDirectory(at: fixture.journal, withIntermediateDirectories: false)
+        } else {
+            try Data("not a recovery journal".utf8).write(to: fixture.journal, options: .atomic)
+        }
+        await #expect(throws: (any Error).self) { try await fixture.coordinator.resume() }
+        #expect(await fixture.coordinator.hasPendingRecovery())
+        await #expect(throws: (any Error).self) { try await fixture.coordinator.prepare() }
+        #expect(await fixture.runner.starts().isEmpty)
+        #expect(FileManager.default.fileExists(atPath: fixture.journal.path))
+    }
+
+    @Test func externalSuccessfulRecoveryIsObservedByOriginalCoordinator() async throws {
+        let fixture = try Fixture()
+        defer { fixture.clean() }
+        try await fixture.coordinator.prepare()
+        try await fixture.coordinator.suspend()
+        try await fixture.makeCoordinator().resume()
+        #expect(!(await fixture.coordinator.hasPendingRecovery()))
+        try await fixture.coordinator.resume()
+        #expect(await fixture.runner.starts().count == 1)
+        #expect(!FileManager.default.fileExists(atPath: fixture.journal.path))
+    }
+
+    @Test func statusRefreshDuringSuspensionPreservesInFlightJournal() async throws {
+        let fixture = try Fixture()
+        defer { fixture.clean() }
+        try await fixture.coordinator.prepare()
+        let coordinator = fixture.coordinator
+        let journalURL = fixture.journal
+        await fixture.runner.setQuitHook {
+            // The actor is suspended awaiting this command. An intervening status
+            // query must not discard its in-progress journal, even if disk changes.
+            try FileManager.default.removeItem(at: journalURL)
+            #expect(await coordinator.recoveryStatus().isPending)
+        }
+        try await fixture.coordinator.suspend()
+        try await fixture.coordinator.resume()
+        #expect(await fixture.runner.starts().count == 1)
+        #expect(!(await fixture.coordinator.hasPendingRecovery()))
+    }
+
     @Test(arguments: ["›", "»"])
     func emptyComposerVariantsKeepExactConversation(_ glyph: String) async throws {
         let fixture = try Fixture()
@@ -528,6 +654,7 @@ private actor FakeHerdr: HerdrCommandRunning {
     private var operations: [String] = []
     private var launchCommands: [String] = []
     private var quitFailure: String?
+    private var quitHook: (@Sendable () async throws -> Void)?
     private var loseResume = false
     private var lateAgent = false
     private var extraArguments: [String] = []
@@ -549,6 +676,7 @@ private actor FakeHerdr: HerdrCommandRunning {
     func setThread(_ pane: String, _ value: String) { agents[agents.firstIndex { $0.pane == pane }!].thread = value }
     func replaceTerminal(_ pane: String) { agents[agents.firstIndex { $0.pane == pane }!].terminal = "replacement" }
     func failQuit(_ pane: String) { quitFailure = pane }
+    func setQuitHook(_ hook: @escaping @Sendable () async throws -> Void) { quitHook = hook }
     func loseNextResumeResponse() { loseResume = true }
     func addAgentAfterQuit() { lateAgent = true }
     func setExtraArguments(_ values: [String]) { extraArguments = values }
@@ -624,6 +752,10 @@ private actor FakeHerdr: HerdrCommandRunning {
             let i = agents.firstIndex { $0.pane == args[2] }!
             operations.append("quit:\(args[2])")
             agents[i].shell = true
+            if let hook = quitHook {
+                quitHook = nil
+                try await hook()
+            }
             if lateAgent {
                 lateAgent = false
                 agents.append(Agent(pane: "w2:p1", terminal: "late", thread: UUID().uuidString, pid: 999))

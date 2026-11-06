@@ -13,9 +13,16 @@ open class AccountController {
     public private(set) var usageStates: [UUID: UsageViewState] = [:] { didSet { onChange?() } }
     public private(set) var subscriptionSnapshots: [UUID: SubscriptionSnapshot] = [:] { didSet { onChange?() } }
     public private(set) var settings: AppSettings = .default { didSet { onChange?() } }
-    public private(set) var isMutating = false { didSet { onChange?() } }
+    public private(set) var isMutating = false {
+        didSet {
+            if isMutating { recoveryRefreshGeneration &+= 1 }
+            onChange?()
+        }
+    }
     public private(set) var isAddingAccount = false { didSet { onChange?() } }
-    public var visibleError: OperationError? { didSet { onChange?() } }
+    public var visibleError: OperationError? {
+        didSet { recoveryErrorStatus = nil; onChange?() }
+    }
     public private(set) var activeIdentityConfirmed = true { didSet { onChange?() } }
     public private(set) var hasHerdrRecovery = false { didSet { onChange?() } }
 
@@ -26,6 +33,9 @@ open class AccountController {
     private var usageRefreshTask: Task<Void, Never>?
     private var nextUsageRefreshTask: Task<Void, Never>?
     private var addAccountTask: Task<Void, Never>?
+    private var recoveryRefreshTask: Task<Void, Never>?
+    private var recoveryRefreshGeneration: UInt64 = 0
+    private var recoveryErrorStatus: SessionRecoveryStatus?
     private var backgroundUsageRefreshInterval: Duration = .seconds(300)
     private var isBackgroundUsageRefreshEnabled = false
     private var resetExpiryExperiment: ResetExpiryExperiment?
@@ -64,7 +74,7 @@ open class AccountController {
         hasStarted = true
         isMutating = true
         defer { isMutating = false }
-        hasHerdrRecovery = await switchService.hasPendingSessionRecovery()
+        await recordRecoveryStatus()
         do {
             settings = try await store.loadSettings()
             apply(try await store.loadRegistry())
@@ -98,6 +108,47 @@ open class AccountController {
 
     public func waitForWeeklyUsageRefresh() async {
         await usageRefreshTask?.value
+    }
+
+    /// Local metadata only: this never sends input to a pane or changes credentials.
+    public func refreshHerdrRecovery() async {
+        guard !isMutating else { return }
+        recoveryRefreshGeneration &+= 1
+        let generation = recoveryRefreshGeneration
+        let status = await switchService.sessionRecoveryStatus()
+        // A switch/recovery may have started while the status request was suspended.
+        guard !Task.isCancelled, !isMutating, generation == recoveryRefreshGeneration else { return }
+        if hasHerdrRecovery != status.isPending { hasHerdrRecovery = status.isPending }
+        if visibleError?.isSessionRecoveryOnly == true,
+           !status.isPending || (status.revision != nil && recoveryErrorStatus != nil && recoveryErrorStatus != status) {
+            visibleError = nil
+        }
+    }
+
+    public func startBackgroundRecoveryRefresh(every interval: Duration = .seconds(2)) {
+        guard recoveryRefreshTask == nil else { return }
+        recoveryRefreshTask = Task { [weak self] in
+            while !Task.isCancelled {
+                await self?.refreshHerdrRecovery()
+                do { try await Task.sleep(for: interval) }
+                catch { return }
+                guard self != nil else { return }
+            }
+        }
+    }
+
+    public func stopBackgroundRecoveryRefresh() {
+        recoveryRefreshTask?.cancel()
+        recoveryRefreshTask = nil
+        recoveryRefreshGeneration &+= 1
+    }
+
+    private func recordRecoveryStatus() async {
+        let status = await switchService.sessionRecoveryStatus()
+        hasHerdrRecovery = status.isPending
+        // Associate the error with the journal that produced it, including the
+        // partial progress persisted by a failed recovery attempt.
+        if visibleError?.isSessionRecoveryOnly == true { recoveryErrorStatus = status }
     }
 
     private func refreshSubscriptionSnapshots() async {
@@ -143,6 +194,8 @@ open class AccountController {
     }
 
     private func performWeeklyUsageRefresh() async {
+        guard !Task.isCancelled else { return }
+        await refreshHerdrRecovery()
         guard !Task.isCancelled else { return }
         do {
             try await syncActiveIdentity()
@@ -211,7 +264,7 @@ open class AccountController {
                     activeIdentityConfirmed = true
                 } catch {
                     showError(error)
-                    hasHerdrRecovery = await switchService.hasPendingSessionRecovery()
+                    await recordRecoveryStatus()
                     return
                 }
                 visibleError = OperationError(
@@ -219,7 +272,8 @@ open class AccountController {
                     titleKey: "switched_reopen_title",
                     messageKey: error.stage == .reopenDesktop ? "switched_reopen_message" : nil,
                     message: error.stage == .reopenDesktop ? text("switched_reopen_message") : error.message,
-                    underlyingDescription: error.underlyingDescription
+                    underlyingDescription: error.underlyingDescription,
+                    isSessionRecoveryOnly: error.isSessionRecoveryOnly
                 )
             } else {
                 if let stage = error.stage,
@@ -231,7 +285,7 @@ open class AccountController {
         } catch {
             showError(error)
         }
-        hasHerdrRecovery = await switchService.hasPendingSessionRecovery()
+        await recordRecoveryStatus()
     }
 
     public func recoverHerdrSessions() async {
@@ -242,11 +296,13 @@ open class AccountController {
         do {
             try await switchService.recoverSessions()
             visibleError = nil
+        } catch let error as OperationError where error.stage == .resumeHerdr {
+            visibleError = error
         } catch {
             activeIdentityConfirmed = false
             showError(error)
         }
-        hasHerdrRecovery = await switchService.hasPendingSessionRecovery()
+        await recordRecoveryStatus()
     }
 
     public func addAccount() {

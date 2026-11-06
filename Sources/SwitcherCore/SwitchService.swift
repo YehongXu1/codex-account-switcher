@@ -23,11 +23,15 @@ public protocol CodexIdentityReading: Sendable {
 public protocol SwitchServicing: Sendable {
     func switchAccount(to targetID: UUID) async throws
     func hasPendingSessionRecovery() async -> Bool
+    func sessionRecoveryStatus() async -> SessionRecoveryStatus
     func recoverSessions() async throws
 }
 
 public extension SwitchServicing {
     func hasPendingSessionRecovery() async -> Bool { false }
+    func sessionRecoveryStatus() async -> SessionRecoveryStatus {
+        SessionRecoveryStatus(isPending: await hasPendingSessionRecovery())
+    }
     func recoverSessions() async throws {}
 }
 
@@ -44,6 +48,7 @@ public struct SwitchService: SwitchServicing {
     }
 
     public func hasPendingSessionRecovery() async -> Bool { await sessions.hasPendingRecovery() }
+    public func sessionRecoveryStatus() async -> SessionRecoveryStatus { await sessions.recoveryStatus() }
     public func recoverSessions() async throws {
         let registry = try await store.loadRegistry()
         guard let activeID = registry.activeAccountID,
@@ -52,7 +57,8 @@ public struct SwitchService: SwitchServicing {
         }
         let identity = try await codex.readIdentity(profileHome: await store.activeCodexHome())
         guard identity.matches(profile) else { throw AccountStoreError.activeCredentialMismatch }
-        try await sessions.resume()
+        do { try await sessions.resume() }
+        catch { throw OperationError.stage(.resumeHerdr, error) }
     }
 
     public func switchAccount(to targetID: UUID) async throws {

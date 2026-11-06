@@ -68,6 +68,7 @@ struct MenuBarPopover: View {
         }
         .task {
             await model.start()
+            await model.refreshHerdrRecovery()
             model.refreshWeeklyUsage()
         }
     }

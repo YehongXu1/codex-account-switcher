@@ -185,6 +185,23 @@ struct SwitchServiceTests {
         #expect(await fixture.recorder.snapshot().last == .reopenDesktop)
     }
 
+    @Test(arguments: [false, true])
+    func onlyPureHerdrFailuresCanBeDismissedWhenRecoveryChanges(_ desktopAlsoFails: Bool) async {
+        let fixture = SwitchFixture(failure: .resumeHerdr, withHerdr: true)
+        let service = SwitchService(
+            desktop: FakeDesktop(recorder: fixture.recorder, failure: desktopAlsoFails ? .reopenDesktop : nil),
+            store: fixture.store, codex: fixture.service.codex, sessions: fixture.sessions
+        )
+        do {
+            try await service.switchAccount(to: fixture.target.id)
+            Issue.record("Expected Herdr recovery failure")
+        } catch let error as OperationError {
+            #expect(error.stage == .resumeHerdr)
+            #expect(error.isSessionRecoveryOnly == !desktopAlsoFails)
+            if desktopAlsoFails { #expect(error.message.contains("Reopening Codex Desktop failed")) }
+        } catch { Issue.record("Expected OperationError, got \(error)") }
+    }
+
     @Test func manualRecoveryRejectsUnexpectedCredentialsAfterFailedRollback() async {
         let fixture = SwitchFixture(failure: .verifyTargetIdentity, restoreFails: true, withHerdr: true)
         await expectFailure(fixture, stage: .verifyTargetIdentity)
